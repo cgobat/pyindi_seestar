@@ -1995,58 +1995,55 @@ class SettingsResource:
         else:
             if check_api_state(telescope_id):
                 settings = get_device_settings(telescope_id)
-        # Maybe we can store this better?
-        settings_friendly_names = {
-            "stack_dither_pix": "Stack Dither Pixels",
-            "stack_dither_interval": "Stack Dither Interval",
-            "stack_dither_enable": "Stack Dither",
-            "exp_ms_stack_l": "Stacking Exposure Length (ms)",
-            "exp_ms_continuous": "Continuous Preview Exposure Length (ms)",
-            "save_discrete_ok_frame": "Save Sub Frames",
-            "save_discrete_frame": "Save Failed Sub Frames",
-            "light_duration_min": "Light Duration Min",
-            "auto_3ppa_calib": "Auto 3 Point Calibration",
-            "frame_calib": "Frame Calibration",
-            "stack_masic": "Stack Mosaic",
-            "rec_stablzn": "Record Stabilization",
-            "manual_exp": "Manual Exposure",
-            "isp_exp_ms": "isp_exp_ms",
-            "calib_location": "calib_location",
-            "wide_cam": "Wide Cam",
-            "temp_unit": "Temperature Unit",
-            "focal_pos": "Focal Position - User Defined",
-            "factory_focal_pos": "Default Focal Position",
-            "heater_enable": "Dew Heater",
-            "auto_power_off": "Auto Power Off",
-            "stack_lenhance": "Light Pollution (LP) Filter"
+        settings_text = {
+            "stack_dither_pix": ("Stack Dither Pixels",
+                                 "Dither by (x) pixels. Reset upon Seestar reboot."),
+            "stack_dither_interval": ("Stack Dither Interval",
+                                      "Dither every (x) sub frames. Reset upon Seestar reboot."),
+            "stack_dither_enable": ("Stack Dither",
+                                    "Enable or disable dither. Reset upon Seestar reboot."),
+            "exp_ms_stack_l": ("Stacking Exposure Length (ms)",
+                               "Stacking Exposure Length (ms)."), # TODO: description repeats name
+            "exp_ms_continuous": ("Continuous Preview Exposure Length (ms)",
+                                  "Continuous Preview Exposure Length (ms), used in the live view."),
+            "save_discrete_ok_frame": ("Save Sub Frames",
+                                       "Save sub frames. (Doesn't include failed.)"),
+            "save_discrete_frame": ("Save Failed Sub Frames",
+                                    'Save failed sub frames. (Failed sub frames will have "_failed" added to'
+                                    ' their filename.)'),
+            "light_duration_min": ("Light Duration Min", # is this min(imum) or min(utes)?
+                                   "Light Duration Min."), # TODO: description repeats name
+            "auto_3ppa_calib": ("Auto 3 Point Calibration",
+                                "Enable or disable 3 point calibration."),
+            "frame_calib": ("Frame Calibration",
+                            "Frame Calibration"), # TODO: description repeats name
+            "stack_masic": ("Stack Mosaic",
+                            "Stack Mosaic"), # TODO: description repeats name
+            "rec_stablzn": ("Record Stabilization",
+                            "Record Stabilization"), # TODO: description repeats name
+            "manual_exp": ("Manual Exposure",
+                           "Manual Exposure"), # TODO: description repeats name
+            "isp_exp_ms": ("isp_exp_ms",
+                           "isp_exp_ms"), # TODO: description repeats name
+            "calib_location": ("calib_location",
+                               "calib_location"), # TODO: description repeats name
+            "wide_cam": ("Wide Cam",
+                         "Wide Cam"), # TODO: description repeats name
+            "temp_unit": ("Temperature Unit",
+                          "Temperature Unit"), # TODO: description repeats name
+            "focal_pos": ("Focal Position - User Defined",
+                          "Focal Position - User Defined"), # TODO: description repeats name
+            "factory_focal_pos": ("Default Focal Position",
+                                  "Default focal position on startup."),
+            "heater_enable": ("Dew Heater",
+                              "Enable or disable dew heater."),
+            "auto_power_off": ("Auto Power Off",
+                               "Enable or disable auto power off"),
+            "stack_lenhance": ("Light Pollution (LP) Filter",
+                               "Enable or disable light pollution (LP) Filter.")
         }
-        # Maybe we can store this better?
-        settings_helper_text = {
-            "stack_dither_pix": "Dither by (x) pixels. Reset upon Seestar reboot.",
-            "stack_dither_interval": "Dither every (x) sub frames. Reset upon Seestar reboot.",
-            "stack_dither_enable": "Enable or disable dither. Reset upon Seestar reboot.",
-            "exp_ms_stack_l": "Stacking Exposure Length (ms).",
-            "exp_ms_continuous": "Continuous Preview Exposure Length (ms), used in the live view.",
-            "save_discrete_ok_frame": "Save sub frames. (Doesn't include failed.)",
-            "save_discrete_frame": "Save failed sub frames. (Failed sub frames will have \"_failed\" added to their filename.)",
-            "light_duration_min": "Light Duration Min.",
-            "auto_3ppa_calib": "Enable or disable 3 point calibration.",
-            "frame_calib": "Frame Calibration",
-            "stack_masic": "Stack Mosaic",
-            "rec_stablzn": "Record Stabilization",
-            "manual_exp": "Manual Exposure",
-            "isp_exp_ms": "isp_exp_ms",
-            "calib_location": "calib_location",
-            "wide_cam": "Wide Cam",
-            "temp_unit": "Temperature Unit",
-            "focal_pos": "Focal Position - User Defined",
-            "factory_focal_pos": "Default focal position on startup.",
-            "heater_enable": "Enable or disable dew heater.",
-            "auto_power_off": "Enable or disable auto power off",
-            "stack_lenhance": "Enable or disable light pollution (LP) Filter."
-        }
-        render_template(req, resp, 'settings.html', settings=settings, settings_friendly_names=settings_friendly_names,
-                        settings_helper_text=settings_helper_text, output=output, **context)
+        render_template(req, resp, 'settings.html', settings=settings, settings_text=settings_text,
+                        output=output, **context)
 
 
 class PlanningResource:

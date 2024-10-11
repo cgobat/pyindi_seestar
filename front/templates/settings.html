@@ -20,8 +20,8 @@
                     {% for key, value in settings.items() %}
                         <tr>
                             <th class="col">
-                                {{ settings_friendly_names[key] }}
-                                <div class="form-text">{{ settings_helper_text[key] }}</div>
+                                {{ settings_text[key][0] }}
+                                <div class="form-text">{{ settings_text[key][1] }}</div>
                             </th>
                             {% if value is true or value is false %}
                                 <td>
