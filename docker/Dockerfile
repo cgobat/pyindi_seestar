@@ -15,6 +15,7 @@ SHELL ["/bin/bash", "-c"]
 
 ENV SEESTAR_USER=seestar
 ENV SEESTAR_USER_HOME=/home/seestar
+ENV ROOT=root
 
 RUN groupadd -g ${SEESTAR_UID} ${SEESTAR_USER} && \
     useradd ${SEESTAR_USER} -u ${SEESTAR_UID} -g ${SEESTAR_GID} -r -m -d ${SEESTAR_USER_HOME} -s /bin/bash
@@ -40,7 +41,7 @@ COPY --chown=${SEESTAR_USER}:${SEESTAR_USER} ./requirements.txt ${SEESTAR_ALP_DI
 
 RUN python3 -m pip install -U pip && \
     python3 -m pip install -r requirements.txt
-    
+
 
 COPY --chown=${SEESTAR_USER}:${SEESTAR_USER} . ${SEESTAR_ALP_DIR}
 COPY --chown=${SEESTAR_USER}:${SEESTAR_USER} ./docker/entrypointALPACA.sh ${SEESTAR_ALP_DIR}/entrypointALPACA.sh
