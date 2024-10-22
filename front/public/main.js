@@ -1,78 +1,165 @@
 // main source code
 
 async function fetchCoordinates() {
-    if (document.getElementById('DS').checked){    
-        if (document.getElementById('targetName').value == '') {
-            alert('You must supply a target name to be looked up in Simbad');
-            return;
-        }
-        // compose the url to retreive the data from the server
-        const baseURL = 
-            `${window.location.protocol}//${window.location.hostname}${window.location.port ? ':' + window.location.port : ''}`;
-        simbadURL = baseURL + '/simbad?name=' + document.getElementById('targetName').value;
-        // fetch the data
-        fetch(simbadURL)
-        .then(response => {
-            if (!response.ok) {
-                if (response.statusText == 'Not Found') {
-                    alert("Target Not Found")
-                    return;
-                } else {
-                    alert('There is an issue contacting Simbad');
-                }
-                throw new Error('Network response was not ok ' + response.statusText);
+    switch (document.getElementById('searchFor').value){
+        // Deepsky    
+        case 'DS':
+            if (document.getElementById('targetName').value == '') {
+                alert('You must supply a target name to be looked up in Simbad');
+                return;
             }
-            return response.text();
-        })
-        .then(data => {
-            // data should come back in the form of 'ra dec'
-            const elements = data.trim().split(/\s+/);
-            document.getElementById('ra').value = elements[0];
-            document.getElementById('dec').value = elements[1];
-            document.getElementById('useLpFilter').checked = false;
-            document.getElementById("useJ2000").checked = true;
-            if (elements[2] == 'on') 
-                document.getElementById('useLpFilter').checked = true;
-        })
-        .catch(error => console.error('There was a problem with the fetch operation:', error));
-
-        } else {
+            // compose the url to retreive the data from the server
+            const baseURL = 
+                `${window.location.protocol}//${window.location.hostname}${window.location.port ? ':' + window.location.port : ''}`;
+            simbadURL = baseURL + '/simbad?name=' + document.getElementById('targetName').value;
+            // fetch the data
+            fetch(simbadURL)
+            .then(response => {
+                if (!response.ok) {
+                    if (response.statusText == 'Not Found') {
+                        alert("Target Not Found")
+                        return;
+                    } else {
+                        alert('There is an issue contacting Simbad');
+                    }
+                    throw new Error('Network response was not ok ' + response.statusText);
+                }
+                return response.text();
+            })
+            .then(data => {
+                // data should come back in the form of 'ra dec'
+                const elements = data.trim().split(/\s+/);
+                document.getElementById('ra').value = elements[0];
+                document.getElementById('dec').value = elements[1];
+                document.getElementById('useLpFilter').checked = false;
+                document.getElementById("useJ2000").checked = true;
+                if (elements[2] == 'on') 
+                    document.getElementById('useLpFilter').checked = true;
+            })
+            .catch(error => console.error('There was a problem with the fetch operation:', error));
+            break;
+        
+        // Planet
+        case 'PL':
             if (document.getElementById('targetName').value == '') {
                 alert('You must supply a planet name to be looked up');
                 return;
             }
             // Grab request text
-            planet = document.getElementById('targetName').value
+            planet = document.getElementById('targetName').value;
             queryURL = '/getplanetcoordinates?planetname=' + planet;
             // Moon / Sun doesn't have 'BARYCENTER' after it but more checks needed for Sun first so just do Moon
             if (planet.toLowerCase() != 'moon') {queryURL += " BARYCENTER"};
             fetch(queryURL)
             .then(response => {
-            if (!response.ok) {
-                if (response.statusText = "Internal SerInternal Server Error") {
-                    alert("Planet " + document.getElementById('targetName').value + " not found!" )
-                    return;
-                } else {
-                    alert('There is an issue contacting planet server');
+                if (!response.ok) {
+                    if (response.statusText = "Internal SerInternal Server Error") {
+                        alert("Planet " + document.getElementById('targetName').value + " not found!" )
+                        return;
+                    } else {
+                        alert('There is an issue contacting planet server');
+                    }
+                    throw new Error('Network response was not ok ' + response.statusText);
                 }
-                throw new Error('Network response was not ok ' + response.statusText);
-            }
-            return response.text();
-        })
-        .then(data => {
-            // data should come back in the form of 05h 18m 48.04s, +22deg 23' 10.8"
-            data = data.replace(/\s/g, '');
-            data = data.replace("deg","d");
-            data = data.replace("'","m");
-            data = data.replace('"', "s");
-            const elements = data.trim().split(",");
-            document.getElementById('ra').value = elements[0];
-            document.getElementById('dec').value = elements[1];
-            document.getElementById("useJ2000").checked = false
-        })
-    }
-}
+                return response.text();
+            })
+            .then(data => {
+                // data should come back in the form of 05h 18m 48.04s, +22deg 23' 10.8"
+                data = data.replace(/\s/g, '');
+                data = data.replace("deg","d");
+                data = data.replace("'","m");
+                data = data.replace('"', "s");
+                const elements = data.trim().split(",");
+                document.getElementById('ra').value = elements[0];
+                document.getElementById('dec').value = elements[1];
+                document.getElementById("useJ2000").checked = false
+            })
+            break;
 
+        // Minor Planet (Asteroid)
+        case 'MP':
+            // Check for valid query info
+            if (document.getElementById('targetName').value == '') {
+                alert('You must supply a planet name to be looked up');
+                return;
+            }
+            minorname = document.getElementById('targetName').value;
+            queryURL = '/getminorplanetcoordinates?minorname=' + minorname;
+            fetch(queryURL)
+            .then(response => {
+                // If a server error or object not found
+                if (!response.ok) {
+                    if (response.statusText = "Not Found") {
+                        alert("Minor planet " + document.getElementById('targetName').value + " not found!" )
+                        return;
+                    } else {
+                        alert('There is an issue contacting the server');
+                    }clearInterval
+                    throw new Error('Network response was not ok ' + response.statusText);
+                }
+                return response.text();
+            })
+            .then(data => {
+                // Only proess if object data sent back
+                if (data){
+                    elements = JSON.parse(data)
+                    
+                    document.getElementById('ra').value = elements.ra;
+                    document.getElementById('dec').value = elements.dec;
+                    document.getElementById('useLpFilter').checked = false;
+                    document.getElementById("useJ2000").checked = true;
+                };
+            });
+            break;
+
+        // Comet    
+        case 'CO':
+            if (document.getElementById('targetName').value == '') {
+                alert('You must supply a planet name to be looked up');
+                return;
+            }
+            cometname = document.getElementById('targetName').value;
+            queryURL = '/getcometcoordinates?cometname=' + cometname;
+            fetch(queryURL)
+            .then(response => {
+                // If a server error or object not found
+                if (!response.ok) {
+                    if (response.statusText = "Not Found") {
+                        alert("Comet " + document.getElementById('targetName').value + " not found!" )
+                        return;
+                    } else {
+                        alert('There is an issue contacting the server');
+                    }
+                    throw new Error('Network response was not ok ' + response.statusText);
+                }
+                return response.text();
+            })
+            .then(data => {
+                // Only proess if object data sent back
+                if (data){
+                    cometData = JSON.parse(data);
+                    if (cometData.length > 1) {
+                        openCometModal(cometData).then(selectedComet => {
+                        document.getElementById('ra').value = selectedComet.ra;
+                        document.getElementById('dec').value = selectedComet.dec;
+                        document.getElementById('targetName').value = selectedComet.cometName;
+                        document.getElementById('useLpFilter').checked = false;
+                        document.getElementById("useJ2000").checked = true;
+                        });
+                    } else {
+                        selectedComet = cometData;
+                        document.getElementById('ra').value = selectedComet.ra;
+                        document.getElementById('dec').value = selectedComet.dec;
+                        document.getElementById('targetName').value = selectedComet.cometName;
+                        document.getElementById('useLpFilter').checked = false;
+                        document.getElementById("useJ2000").checked = true;
+                    };
+                
+                };
+            });
+        break;
+    }
+};
 
 async function fetchClipboard() {
     try {
@@ -219,4 +306,41 @@ async function get_location_from_IP() {
     } catch (error) {
         console.error(error.message);
     }
+}
+
+let selectedComet = null;
+
+// Function to open the modal and populate the comet list
+function openCometModal(comets) {
+    return new Promise((resolve) => {
+        const cometList = document.getElementById("cometList");
+        const modal = new bootstrap.Modal(document.getElementById('cometModal'));
+
+        cometList.innerHTML = '';
+
+        comets.forEach(comet => {
+            const li = document.createElement('li');
+            li.classList.add('list-group-item', 'list-group-item-action');
+            li.textContent = comet.cometName;
+            li.addEventListener('click', () => {
+                selectedComet = comet;
+                resolve(selectedComet);  // Resolve the promise with the selected comet
+                modal.hide();
+            });
+            cometList.appendChild(li);
+        });
+
+        modal.show();
+    });
+}
+
+// Function to handle the selected comet object (optional)
+function handleCometSelection(comet) {
+    //console.log("Comet selected:", comet);
+    document.getElementById('ra').value = scomet.ra;
+    document.getElementById('dec').value = comet.dec;
+    document.getElementById('targetName').value = comet.cometName;
+    document.getElementById('useLpFilter').checked = false;
+    document.getElementById("useJ2000").checked = true;
+    
 }
