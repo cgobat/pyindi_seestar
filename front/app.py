@@ -1,6 +1,6 @@
 import time
 from datetime import datetime, timedelta
-from tzlocal import get_localzone
+import tzlocal
 
 import falcon
 from falcon import HTTPTemporaryRedirect, HTTPFound
@@ -30,7 +30,10 @@ import signal
 import math
 import numpy as np
 
-from skyfield.api import load
+from skyfield.api import Loader
+from skyfield.data import mpc 
+from skyfield.constants import GM_SUN_Pitjeva_2005_km3_s2 as GM_SUN
+
 
 from device.seestar_logs import SeestarLogging
 from device.config import Config  # type: ignore
@@ -41,7 +44,7 @@ import threading
 import pydash
 
 logger = init_logging()
-
+load = Loader('data/')
 
 def get_ip():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -166,7 +169,7 @@ def get_flash_cookie(req, resp):
 def update_twilight_times(latitude=None, longitude=None):
     observer = ephem.Observer()
     observer.date = datetime.now()
-    local_timezone = get_localzone()
+    local_timezone = tzlocal.get_localzone()
     sun = ephem.Sun()
     current_date_formatted = str(datetime.now().strftime("%Y-%m-%d"))
 
@@ -873,11 +876,16 @@ def do_command(req, resp, telescope_id):
         case "start_up_sequence":
             lat = form.get("lat","").strip()
             long = form.get("long","").strip()
+            auto_focus = form.get("auto_focus","False").strip() == "on"
+            dark_frames = form.get("dark_frames","False").strip() == "on"
+            polar_align = form.get("polar_align","False").strip() == "on"
+            raise_arm = form.get("raise_arm","False").strip() == "on"
+
             #print(f"action_start_up_sequence - Latitude {lat} Longitude {long}")
             if not lat or not long:
-                output = do_action_device("action_start_up_sequence", telescope_id, {})
+                output = do_action_device("action_start_up_sequence", telescope_id, {"auto_focus": auto_focus, "dark_frames": dark_frames, "3ppa": polar_align, "raise_arm": raise_arm})
             else:
-                output = do_action_device("action_start_up_sequence", telescope_id, {"lat": lat, "lon": long})
+                output = do_action_device("action_start_up_sequence", telescope_id, {"lat": lat, "lon": long, "auto_focus": auto_focus, "dark_frames": dark_frames, "3ppa": polar_align, "raise_arm": raise_arm})
             return output
         case "get_event_state":
             output = do_action_device("get_event_state", telescope_id, {})
@@ -1011,6 +1019,7 @@ def do_command(req, resp, telescope_id):
 def do_support_bundle(req, telescope_id = 1):
     zip_buffer = io.BytesIO()
     desc = req.media["desc"]
+    getSeestarLogs = req.media.get("getSeestarLogs") == "on"
     logger.debug("do_support_bundle: getting logs (starting)")
     with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
         # Add logs
@@ -1039,7 +1048,9 @@ def do_support_bundle(req, telescope_id = 1):
 
         if os_name == "Linux":
             cmd_result = subprocess.check_output(['journalctl', '-u', 'seestar'])
-            zip_file.writestr("service_journal.txt", cmd_result)
+            zip_file.writestr("seestar_service_journal.txt", cmd_result)
+            cmd_result = subprocess.check_output(['journalctl', '-u', 'INDI'])
+            zip_file.writestr("INDI_service_journal.txt", cmd_result)
         #if os.path.isdir('.git'):
         #    cmd_result = subprocess.check_output(['git', 'log', '-n', '1'])
         #    zip_file.writestr("git_version.txt", cmd_result)
@@ -1061,13 +1072,14 @@ def do_support_bundle(req, telescope_id = 1):
             if path is not None:
                 cmd_result = subprocess.check_output(['python3', '--version'])
                 zip_file.writestr("python3_version.txt", cmd_result)
-                    
+
         env_vars = os.environ
         env_content = "\n".join(f"{key}={value}" for key, value in env_vars.items())
         zip_file.writestr("env.txt", env_content)
-                    
 
-        if telescope_id in telescope.seestar_logcollector:
+        online = check_api_state(telescope_id)
+
+        if online and getSeestarLogs and telescope_id in telescope.seestar_logcollector:
             dev_log = telescope.get_seestar_logcollector(telescope_id)
             zip_data = dev_log.get_logs_sync()
             zip_file.writestr(f"seestar_{telescope_id}_logs.zip", zip_data)
@@ -1386,7 +1398,7 @@ class ImageResource:
             state = current["Value"]["state"]
             schedule = current["Value"]
         else:
-            state = "Stopped"
+            state = "stopped"
             schedule = {"list": get_queue(telescope_id)}
         context = get_context(telescope_id, req)
         # remove values=values to stop remembering values
@@ -1410,7 +1422,7 @@ class GotoResource:
             current = do_action_device("get_schedule", telescope_id, {})
             state = current["Value"]["state"]
         else:
-            state = "Stopped"
+            state = "stopped"
         context = get_context(telescope_id, req)
         # remove values=values to stop remembering values
         render_template(req, resp, 'goto.html', state=state, schedule=schedule, values=values, errors=errors, action=f"/{telescope_id}/goto", **context)
@@ -1435,7 +1447,7 @@ class CommandResource:
             
         else:
             schedule = {"list": get_queue(telescope_id)}
-            state = "Stopped"
+            state = "stopped"
 
         context = get_context(telescope_id, req)
 
@@ -1468,7 +1480,7 @@ class MosaicResource:
             state = current["Value"]["state"]
             schedule = current["Value"]
         else:
-            state = "Stopped"
+            state = "stopped"
             schedule = {"list": get_queue(telescope_id)}
         context = get_context(telescope_id, req)
         # remove values=values to stop remembering values
@@ -1639,7 +1651,7 @@ class ScheduleToggleResource:
     def on_post(self, req, resp, telescope_id=0):
         current = do_action_device("get_schedule", telescope_id, {})
         state = current["Value"]["state"]
-        if state == "Stopped":
+        if state == "stopped" or state == "complete":
             do_action_device("start_scheduler", telescope_id, {})
         else:
             do_action_device("stop_scheduler", telescope_id, {})
@@ -1651,7 +1663,7 @@ class ScheduleToggleResource:
             current = do_action_device("get_schedule", telescope_id, {})
             state = current["Value"]["state"]
         else:
-            state = "Stopped"
+            state = "stopped"
         context = get_context(telescope_id, req)
         render_template(req, resp, 'partials/schedule_state.html', state=state, **context)
 
@@ -1663,7 +1675,7 @@ class ScheduleClearResource:
             current = do_action_device("get_schedule", telescope_id, {})
             state = current["Value"]["state"]
 
-            if state == "Running":
+            if state == "working":
                 do_action_device("stop_scheduler", telescope_id, {})
                 flash(resp, "Stopping scheduler")
 
@@ -2047,7 +2059,7 @@ class PlanningResource:
             nearest_csc["full_img"] = ""
         
         planning_cards = get_planning_cards()
-        local_timezone = get_localzone()
+        local_timezone = tzlocal.get_localzone()
         current_time = datetime.now(local_timezone)
         utc_offset = current_time.utcoffset()
         utc_offset = int(utc_offset.total_seconds() / 3600) # Convert the offset to hours, used for astromosaic
@@ -2401,6 +2413,18 @@ class TogglePlanningCardResource:
         else:
             update_planning_card_state(card_name, "planning_page_enable", True)
 
+class CollapsePlanningCardResource:
+    @staticmethod
+    def on_post(req, resp):
+        PostedForm = req.media
+        card_name = str(PostedForm["card_name"])
+        # Get current card state
+        current_card_state = get_planning_card_state(card_name)
+        if current_card_state["planning_page_collapsed"]:
+            update_planning_card_state(card_name, "planning_page_collapsed", False)
+        else:
+            update_planning_card_state(card_name, "planning_page_collapsed", True)
+
 
 class UpdateTwilightTimesResource:
     @staticmethod
@@ -2489,6 +2513,133 @@ class GetPlanetCoordinates():
         resp.content_type = 'application/text'
         resp.text = (f"{ra}, {dec}")
 
+def checkFileAge():
+    if (os.path.exists('data/CometEls.txt') == False):
+        redownload = True
+    else:
+        creation_date = datetime.fromtimestamp(os.path.getctime('data/CometEls.txt'))
+        today = datetime.today()
+        delta = today - creation_date
+        if (delta.days > 7): 
+            redownload  = True
+        else:
+            redownload = False
+    return redownload
+
+
+def get_UTC_Time():
+    local_time = datetime.now(tzlocal.get_localzone())
+    utc_time = local_time - local_time.utcoffset()  # Manually adjust to UTC
+    return utc_time.year, utc_time.month, utc_time.day, utc_time.hour, utc_time.minute, utc_time.second
+
+def searchComet(name):
+    with load.open(mpc.COMET_URL, reload=checkFileAge()) as f:
+        comets = mpc.load_comets_dataframe(f)
+
+    # Keep only the most recent orbit for each comet,
+    # and index by designation for fast lookup.
+    comets = (comets.sort_values('reference')
+            .groupby('designation', as_index=False).last()
+            .set_index('designation', drop=False))
+
+    regex = re.compile(r'{}'.format(re.escape(name)), re.IGNORECASE)
+
+    row =  comets[comets['designation'].str.contains(regex)]
+    match len(row):
+        case 0: # Nothing returned
+            return ""
+        case 1: # Single record returned
+            ts = load.timescale()
+            eph = load('de440s.bsp')
+            sun, earth = eph['sun'], eph['earth']
+            comet = sun + mpc.comet_orbit(row.iloc[0], ts, GM_SUN)
+            Y,M,D,h,m,s = get_UTC_Time()
+            t = ts.utc(Y,M,D,h,m,s)
+            ra, dec, distance = earth.at(t).observe(comet).radec()
+            data = {"ra" : str(ra).replace(" ",""), "dec" : str(dec).replace('deg','d').replace("'","m").replace('"',"s").replace(" ",""), "cometName" : str(comet.target)}
+            return json.dumps(data, indent = 4)
+
+        case r if r > 1: # Multiple records returned
+            ts = load.timescale()
+            eph = load('de440s.bsp')
+            sun, earth = eph['sun'], eph['earth']
+            Y,M,D,h,m,s = get_UTC_Time()
+            t = ts.utc(Y,M,D,h,m,s)
+
+            data = []
+            for index, r in row.iterrows():
+                comet = sun + mpc.comet_orbit(r, ts, GM_SUN)  # Use `r`, the current row
+                ra, dec, distance = earth.at(t).observe(comet).radec()
+                
+                data.append({
+                    "ra": str(ra).replace(" ",""),
+                    "dec": str(dec).replace('deg','d').replace("'","m").replace('"',"s").replace(" ",""),
+                    "cometName": str(comet.target)
+                })
+            return json.dumps(data, indent = 4)
+
+            
+def searchMinorPlanet(name):
+    if os.path.exists('data/mpn-01.txt'):
+        mpcFile = 'mpn-01.txt'
+    else:
+        mpcFile = 'http://dss.stellarium.org/MPC/mpn-01.txt'
+
+    with load.open(mpcFile) as f:
+        minor_planets = mpc.load_mpcorb_dataframe(f)
+
+    bad_orbits = minor_planets.semimajor_axis_au.isnull()
+    minor_planets = minor_planets[~bad_orbits]
+
+    regex = re.compile(r'\b{}\b'.format(name), re.IGNORECASE)
+    # Example: Filter for a specific asteroid by designation
+    row = minor_planets[minor_planets['designation'].str.contains(regex)]
+
+    if row.empty:
+         return ""
+    
+    ts = load.timescale()
+    eph = load('de440s.bsp')
+    sun, earth = eph['sun'], eph['earth']
+
+    object = sun + mpc.mpcorb_orbit(row.iloc[0], ts, GM_SUN)
+    Y,M,D,h,m,s = get_UTC_Time()
+    t = ts.utc(Y,M,D,h,m,s)
+    ra, dec, distance = earth.at(t).observe(object).radec()
+    
+    data = {"ra" : str(ra).replace(" ",""), "dec" : str(dec).replace('deg','d').replace("'","m").replace('"',"s").replace(" ","")}
+    return json.dumps(data, indent = 4)
+
+class GetCometCoordinates():
+    @staticmethod
+    def on_get(req, resp):
+        cometName = req.get_param('cometname')
+        rtn = searchComet(cometName)
+        if (len(rtn) == 0):
+            resp.status = falcon.HTTP_404
+            resp.content_type = 'application/text'
+            resp.text = 'Object not found'
+            return
+        else:
+            resp.status = falcon.HTTP_200
+            resp.content_type = 'application/text'
+            resp.text = (rtn)
+
+class GetMinorPlanetCoordinates():
+    @staticmethod
+    def on_get(req, resp):
+        minorname = req.get_param('minorname')
+        rtn = searchMinorPlanet(minorname)
+        if (len(rtn) == 0):
+            resp.status = falcon.HTTP_404
+            resp.content_type = 'application/text'
+            resp.text = 'Object not found'
+            return 
+        else:
+            resp.status = falcon.HTTP_200
+            resp.content_type = 'application/text'
+            resp.text = (rtn)
+
 
 class FrontMain:
     def __init__(self):
@@ -2571,10 +2722,13 @@ class FrontMain:
         app.add_route('/stellarium', StellariumResource())
         app.add_route('/toggleuitheme', ToggleUIThemeResource())
         app.add_route('/toggleplanningcard', TogglePlanningCardResource())
+        app.add_route('/collapseplanningcard', CollapsePlanningCardResource())
         app.add_route('/updatetwilighttimes', UpdateTwilightTimesResource())
         app.add_route('/getbalancesensor', GetBalanceSensorResource())
         app.add_route('/gensupportbundle', GenSupportBundleResource())
         app.add_route('/getplanetcoordinates', GetPlanetCoordinates())
+        app.add_route('/getcometcoordinates', GetCometCoordinates())
+        app.add_route('/getminorplanetcoordinates', GetMinorPlanetCoordinates())
         app.add_route('/config', ConfigResource())
 
         try:

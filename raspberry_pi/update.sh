@@ -9,6 +9,12 @@ function update() {
       FORCE=true
   fi
 
+  # internal parameter used to re-launch self with new source
+  if [ "$1" = "--relaunch" ]; then
+      FORCE=true
+      RELAUNCH=true
+  fi
+
   # check if update is required
   cd "${src_home}"
   git fetch origin
@@ -17,19 +23,22 @@ function update() {
       exit 0
   fi
 
-  if $(systemctl is-active --quiet seestar_device); then
-    sudo systemctl stop seestar_device
-  fi
+  cd ${src_home}
+  git pull
 
-  if $(systemctl is-active --quiet seestar_front); then
-    sudo systemctl stop seestar_front
+  # Update script needs to relaunch itsself, to pick up source changes
+  if [ -z "${RELAUNCH}" ]; then
+    echo "Re-launching update script with new source"
+    exec ${src_home}/raspberry_pi/update.sh --relaunch
   fi
 
   if $(systemctl is-active --quiet seestar); then
     sudo systemctl stop seestar
   fi
 
-  cd ${src_home}
+  if $(systemctl is-active --quiet INDI); then
+    sudo systemctl stop INDI
+  fi
 
   # Perform any update operations here, that need to change
   # prior behavior on the system
@@ -44,6 +53,7 @@ function update() {
   config_toml_setup
   install_apt_packages
   python_virtualenv_setup
+  network_config
   systemd_service_setup
   print_banner "update"
 }
