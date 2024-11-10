@@ -531,14 +531,26 @@ class SeestarImaging:
             self.exposure_mode = None
 
     def blank_frame(self, message="Loading..."):
+        #load the gif image
+        gif_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "loading.gif")
+
+        if message == "Loading...":
+            try:
+                with open(gif_path, 'rb') as gif_file:
+                    gif_data = gif_file.read()
+
+                    return (b'Content-Type: image/gif\r\n\r\n' + gif_data +self.BOUNDARY)
+            except Exception as e:
+                pass
+
         blank_image = np.ones((1920, 1080, 3), dtype=np.uint8)
         font = cv2.FONT_HERSHEY_SIMPLEX
         image = cv2.putText(blank_image, message,
-                            (200, 900),
-                            # (300, 1850),
-                            font, 5,
-                            (128, 128, 128),
-                            4, cv2.LINE_8)
+                          (200, 900),
+                          # (300, 1850),
+                          font, 5,
+                          (128, 128, 128),
+                          4, cv2.LINE_8)
         imgencode = cv2.imencode('.png', image)[1]
         stringData = imgencode.tobytes()
         return (b'Content-Type: image/png\r\n\r\n' + stringData + self.BOUNDARY)

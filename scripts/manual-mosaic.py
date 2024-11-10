@@ -50,6 +50,12 @@ class ManualMosaic:
         delta_RA = spacing_result[0]
         delta_Dec = spacing_result[1]
 
+        # adjust mosaic center if num panels is even
+        if self.tunables.nRA % 2 == 0:
+            center_RA += delta_RA / 2
+        if self.tunables.nDec % 2 == 0:
+            center_Dec += delta_Dec / 2
+
         cur_dec = center_Dec - int(self.tunables.nDec / 2) * delta_Dec
 
         for index_dec in range(self.tunables.nDec):

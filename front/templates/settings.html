@@ -9,7 +9,7 @@
 
 {% block content %}
 
-    {% if online and settings %}
+    {% if client_master and online and settings %}
         <div class="container mt-3">
             {% if output %}
                 <div class="alert alert-primary" role="alert">{{output}}</div>
@@ -62,7 +62,12 @@
                     </tbody>
                 </table>
                 <button type="submit" class="btn btn-primary">Save</button>
-            </form>    
+            </form>
+        </div>
+    {% elif not client_master %}
+        <div class="container mt-3">
+          <p>You are currently in guest mode. You can release this in the Advanced->Guest Mode of the SeeStar app.</p>
+          <p>See the <a href="https://github.com/smart-underworld/seestar_alp/wiki/Guest-Mode">Guest Mode</a> wiki page for details</p>
         </div>
     {% else %}
         <div class="container mt-3">
