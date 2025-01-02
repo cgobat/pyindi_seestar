@@ -68,6 +68,13 @@ class _Config:
 
         self.load_toml(self.path_to_dat)
 
+    @staticmethod
+    def strToBool(inputString: str):
+        if inputString in ["True", "true", "on"] or inputString == True:
+            return True
+        else:
+            return False
+
     def get_toml(self, sect: str, item: str, default : typing.Any):
         """
         Helper method for getting a toml value out of the dict representation
@@ -106,12 +113,17 @@ class _Config:
         # --------------
         self.uiport: int = self.get_toml('webui_settings', 'uiport', 5432)
         self.uitheme: str = self.get_toml('webui_settings', 'uitheme', 'dark')
-        self.twilighttimes: bool = self.get_toml('webui_settings', 'twilighttimes', False)
-        self.cleardarksky: bool = self.get_toml('webui_settings', 'cleardarksky', False)
         self.experimental: bool = self.get_toml('webui_settings', 'experimental', False)
         self.confirm: bool = self.get_toml('webui_settings', 'confirm', True)
         self.save_frames: bool = self.get_toml('webui_settings', 'save_frames', False)
         self.save_frames_dir: str = self.get_toml('webui_settings', 'save_frames_dir', '.')
+        self.loading_gif: str = self.get_toml('webui_settings', 'loading_gif', 'loading.gif')
+
+        # Fixup bad configs
+        if f"{self.save_frames_dir}" == "True" or f"{self.save_frames_dir}" == "False":
+            self.save_frames_dir = '.'
+        if f"{self.loading_gif}" == "True" or f"{self.loading_gif}" == "False":
+            self.loading_gif = 'loading.gif'
 
         # --------------
         # Server Section
@@ -132,9 +144,24 @@ class _Config:
             {
                 'name': 'Seestar Alpha',
                 'ip_address': 'seestar.local',
+                'scope_aim_lat':  60.0,
+                'scope_aim_lon':  20.0,
+                'is_EQ_mode':  False,
                 'device_num': 1
             }
             ]
+
+        # For the rare situation of manually edited toml where the highest
+        # device_num is higher than the number of devices, we rewrite the device_num
+        # sequentially.
+
+        for seestar in self.seestars:
+            if int(seestar['device_num']) > len(self.seestars):
+                counter = 1
+                for ss in self.seestars:
+                    ss['device_num'] = counter
+                    counter += 1
+
 
         # ---------------
         # Logging Section
@@ -164,14 +191,52 @@ class _Config:
         self.init_dither_frequency: int = self.get_toml(section, 'dither_frequency', 10)
         self.init_activate_LP_filter: bool = self.get_toml(section, 'activate_LP_filter', False)
         self.init_dew_heater_power: int = self.get_toml(section, 'dew_heater_power', 0)
+        self.init_guest_mode: bool = self.get_toml(section, 'guest_mode_init', True)
         self.scope_aim_lat: float = self.get_toml(section, 'scope_aim_lat', 60.0)
         self.scope_aim_lon: float = self.get_toml(section, 'scope_aim_lon', 20.0)
         self.is_EQ_mode: bool = self.get_toml(section, 'is_EQ_mode', False)
+
 
     def load_from_form(self, req):
         """
         Save the config html form into a toml file
         """
+
+        form_data = req.get_media()
+
+
+        # Reset arrays
+        self.seestars = []
+        self._dict['seestars'].clear()
+
+        # Check if 'ss_name' is a list
+        if isinstance(req.media['ss_name'], list):
+            deviceCount = len(req.media['ss_name'])
+        else:
+            deviceCount = 1
+
+        # Iterate through the devices and add them to the lists
+        for devNum in range(deviceCount):
+            if deviceCount > 1:
+                ss_name = req.media['ss_name'][devNum]
+                ss_ip = req.media['ss_ip_address'][devNum]
+                ss_lat = req.media['ss_scope_aim_lat'][devNum]
+                ss_lon = req.media['ss_scope_aim_lon'][devNum]
+                ss_eq = self.strToBool(req.media['ss_is_EQ_mode'][devNum])
+                print (f'Device {devNum} EQ is : {ss_eq}')
+            else:
+                ss_name = req.media['ss_name']
+                ss_ip = req.media['ss_ip_address']
+                ss_lat = req.media['ss_scope_aim_lat']
+                ss_lon = req.media['ss_scope_aim_lon']
+                ss_eq = self.strToBool(req.media['ss_is_EQ_mode'])
+
+            # Add to local config
+            self.seestars.append({'name': ss_name, 'ip_address': ss_ip, 'device_num': devNum + 1, 'scope_aim_lat': float(ss_lat), 'scope_aim_lon': float(ss_lon), 'is_EQ_mode': ss_eq})
+            # Add to toml config
+            self._dict['seestars'].append({'name': ss_name, 'ip_address': ss_ip, 'device_num': devNum + 1, 'scope_aim_lat': float(ss_lat), 'scope_aim_lon': float(ss_lon), 'is_EQ_mode': ss_eq})
+
+
         # network
         self.set_toml('network', 'ip_address', req.media['ip_address'])
         self.set_toml('network', 'port', int(req.media['port']))
@@ -184,11 +249,11 @@ class _Config:
         # webUI
         self.set_toml('webui_settings', 'uiport', int(req.media['uiport']))
         self.set_toml('webui_settings', 'uitheme', req.media['uitheme'])
-        self.set_toml('webui_settings', 'twilighttimes', 'twilighttimes' in req.media)
         self.set_toml('webui_settings', 'experimental', 'experimental' in req.media)
         self.set_toml('webui_settings', 'confirm', 'confirm' in req.media)
         self.set_toml('webui_settings', 'save_frames', 'save_frames' in req.media)
-        self.set_toml('webui_settings', 'save_frames_dir', 'save_frames_dir' in req.media)
+        self.set_toml('webui_settings', 'save_frames_dir', req.media['save_frames_dir'])
+        self.set_toml('webui_settings', 'loading_gif', req.media['loading_gif'])
 
         # server
         self.set_toml('server', 'location', req.media['location'])
@@ -223,6 +288,7 @@ class _Config:
         self.set_toml('seestar_initialization', 'scope_aim_lat', float(req.media['scope_aim_lat']))
         self.set_toml('seestar_initialization', 'scope_aim_lon', float(req.media['scope_aim_lon']))
         self.set_toml('seestar_initialization', 'is_EQ_mode', 'is_EQ_mode' in req.media)
+        self.set_toml('seestar_initialization', 'guest_mode_init', 'init_guest_mode' in req.media)
 
     def load_toml(self, load_name = None):
         """
@@ -251,46 +317,195 @@ class _Config:
     #
     # HTML config rendering
     #
-    def render_text(self, name, label, value):
+    def render_text(self, name, label, value, description='', required=False):
         """
         Render config html form text input
         """
-        return f'<label for="{name}" class="form-label">{label}</label> <input id="{name}" name="{name}" type="text" value="{value}"><br>\n'
+        if type(value) is tomlkit.items.Integer or type(value) is tomlkit.items.Float:
+            strType = 'number'
+            step = 'step="any"'
+        else:
+            strType = 'text'
+            step= ''
 
-    def render_checkbox(self, name, label, checked):
+        if required:
+            valRequired = 'required'
+        else:
+            valRequired = ''
+
+        ret = f'''<div class="row mb-3 align-items-center"> <!-- Row -->
+                            <div class="col-sm-4 text-end"> <!-- Col -->
+                                <label for="{name}" class="form-label">{label}</label>
+                            </div> <!-- Close Col -->
+                            <div class="col-sm-8 col-md-6"> <!-- Col -->
+                                <input id="{name}" name="{name}" type="{strType}" class="form-control" title="{description}" {step} value="{value}" {valRequired}>
+                            </div> <!-- Close Col -->
+                        </div> <!-- Close Row -->
+                    '''
+        return ret
+
+    def render_checkbox(self, name, label, checked, description = '',  hidden = False):
         """
         Render config html form boolean checkbox
         """
-        ret = f'<label for="{name}" class="form-label">{label}</label> '
+
         if checked:
-            c=" checked"
+            c="checked"
         else:
             c=""
-        ret += f'<input id="{name}" name="{name}" type="checkbox"{c}><br>\n'
+
+
+        if hidden:
+            t = "hidden"
+            v = 'value=""'
+
+            ret= f'''<div class="col-sm-8 col-md-6"> <!-- Checkbox -->
+                                <input id="{name}_hidden" name="{name}" class="form-check-input" title="{description}" type="{t}" {v} {c}>
+                            </div> <!--Close checkbox -->'''
+
+        else:
+            t = "checkbox"
+            v = ''
+
+            ret = f'''<div class="row mb-3 align-items-center"> <!-- Checkbox Row -->
+                                <div class="col-sm-4 text-end"> <!-- Checkbox label -->
+                                    <label for="{name}" class="form-label">
+                                        {label}
+                                    </label>
+                                </div> <!-- Close checkbox label -->
+                                <div class="col-sm-8 col-md-6"> <!-- Checkbox -->
+                                    <input id="{name}" name="{name}" class="form-check-input" title="{description}" type="{t}" {c}>
+                                </div> <!--Close checkbox -->
+                            </div> <!-- Close checkbox row -->
+                        '''
         return ret
 
-    def render_select(self, name, label, options, default):
+    def render_select(self, name, label, options, default, description = ''):
         """
         Render config html select dropdown
         """
-        ret = f'<label for="{name}" class="form-label">{label}</label><select id="{name}" name="{name}"> '
+        retOpt = ''
         for opt in options:
             if opt == default:
-                s=" selected"
+                s="selected"
             else:
                 s=""
-            ret += f'<option value="{opt}"{s}>{opt}</option>'
-        ret += '</select><br>\n'
+            retOpt += f'<option value="{opt}" {s}>{opt}</option>'
+
+        ret = f'''<div class="row mb-3 align-items-center">
+                            <div class="col-sm-4 text-end">
+                                <label for="{name}" class="form-label">
+                                    {label}
+                                </label>
+                            </div>
+                            <div class="col-sm-8 col-md-6">
+                                <select class="custom-select" id="{name}" name="{name}" title="{description}">
+                                    {retOpt}
+                                </select>
+                            </div>
+                       </div>
+                    '''
         return ret
 
-    def render_config_section(self, title, content):
+    def render_config_section(self, title, content, id=''):
         """
         Render config html config section div
         """
-        return '<div class="card-body border">' + \
-			   f'<h5 class="card-title">{title}</h5>' + \
-               content + \
-               '</div>\n'
+        divtxt = ''
+
+        if id != '':
+            needID = f'id="{id}">'
+        else:
+            needID = '>'
+
+        divtxt += f'''<div class="card border-primary mb-3"> <!-- Card Border -->
+                            <div class="card-header"> <!-- Card header -->
+                                <h3>{title}</h3>
+                            </div> <!-- Close card header -->
+                            <div class="card-body border-primary mb-3" {needID}
+                                <div class="container"> <!-- Container -->
+                                    {content}
+                                </div> <!-- Close container -->
+                            </div> <!-- Close card body border -->
+                     </div> <!-- Close card border -->
+                   '''
+        return divtxt
+
+    def render_seestars(self):
+        """
+        Render list of seestars
+        """
+        ssHTML = ''
+        for seestar in self.seestars:
+            if 'scope_aim_lat' in seestar:
+                lat = self.render_text('ss_scope_aim_lat','Aim Lat',seestar['scope_aim_lat'],'start up latitude in degrees -90 to 80')
+            else:
+                lat = self.render_text('ss_scope_aim_lat','Aim Lat',60,'start up latitude in degrees -90 to 80')
+
+            if 'scope_aim_lon' in seestar:
+                lon = self.render_text('ss_scope_aim_lon','Aim Long',seestar['scope_aim_lon'],'start up longitude in degrees 0 to 360')
+            else:
+                lon = self.render_text('ss_scope_aim_lon','Aim Long',20,'start up longitude in degrees 0 to 360')
+
+
+            c = ""
+            h = "False"
+
+            if 'is_EQ_mode' in seestar:
+                if self.strToBool(seestar['is_EQ_mode']):
+                    c = "checked"
+                    h = "True"
+
+
+            ssHTML += f'''<div id="device_div_{seestar["device_num"]}">
+                                <div class="col-sm-4 text-end">
+                                    <label class="form-label">
+                                    <h3>Device number {seestar["device_num"]}</h3>
+                                    </label>
+                                </div>
+                                {self.render_text('ss_name', "Name", seestar["name"], required=True)}
+                                {self.render_text('ss_ip_address', "IP Address", seestar["ip_address"], required=True)}
+                                {lat}
+                                {lon}
+                                <input id="ss_is_EQ_mode_hidden_{seestar["device_num"]}" name="ss_is_EQ_mode" type="hidden" value="{h}">
+
+                                <div class="row mb-3 align-items-center"> <!-- Checkbox Row -->
+                                    <div class="col-sm-4 text-end"> <!-- Checkbox label -->
+                                        <label for="ss_is_EQ_mode_{seestar["device_num"]}" class="form-label">
+                                            Is device in EQ mode
+                                        </label>
+                                    </div> <!-- Close checkbox label -->
+                                    <div class="col-sm-8 col-md-6"> <!-- Checkbox -->
+                                        <input id="ss_is_EQ_mode_{seestar["device_num"]}" class="form-check-input" title="Is device in EQ mode" type="checkbox" {c}>
+                                    </div> <!--Close checkbox -->
+                                </div> <!-- Close checkbox row -->
+                                {self.render_checkbox(f'delete_{seestar["device_num"]}',"Delete device",False)}
+
+                            </div>
+
+                        '''
+
+        ret = f'''
+                <div class="row mb-3 align-items-center">
+                    {ssHTML}
+                </div>
+                <div class="align-items-center">
+                    <button style="margin:5px;" type="button" class="btn btn-primary" id="add_seestar" onclick="addSeestar()">
+                        Add Seestar Device
+                    </button>
+                    <button style="margin:5px;" type="button" class="btn btn-primary" id="del_Seestar" onclick="delSeestar()">
+                        Delete selected Seestar(s)
+                    </button>
+                </div>
+                '''
+        return ret
+
+    def convert_AOT(self, settings):
+        seestars = settings['seestars']
+        ret = []
+        for seestar in seestars:
+            ret.append(seestar)
+        return ret
 
     def render_config_html(self):
         """
@@ -300,61 +515,64 @@ class _Config:
         return \
             self.render_config_section(
                 'Networking',
-                self.render_text('ip_address', 'IP address:', self.ip_address) + \
-                self.render_text('port', 'Port:', self.port) + \
-                self.render_text('imgport', 'IMG Port:', self.imgport) + \
-                self.render_text('stport', 'ST port:', self.stport) + \
-                self.render_text('sthost', 'ST host:', self.sthost) + \
-                self.render_text('timeout', 'Timeout:', self.timeout) + \
-                self.render_checkbox('rtsp_udp', 'RTSP UDP:', self.rtsp_udp)
+                self.render_text('ip_address', 'IP address:', self.ip_address, 'IP address to open for communication, use 127.0.0.1 if running on one machine\n or use 0.0.0.0 to acess from all adresses', required=True) + \
+                self.render_text('port', 'Port:', self.port, 'Port that alpaca will run on (this should not need to be changed except in extreme cases) default 5555', required=True) + \
+                self.render_text('imgport', 'IMG Port:', self.imgport, 'Imaging API port (this should not need to be changed except in extreme cases) default 7556', required=True) + \
+                self.render_text('sthost', 'Stellarium host:', self.sthost, 'IP address of the machine running stellarium (127.0.0.1 if on same machine as ALP)') + \
+                self.render_text('stport', 'Stellarium port:', self.stport, 'Port to connect to stellarium on (default 8090)' ) + \
+                self.render_text('timeout', 'Timeout:', self.timeout, 'General socket timeout (this should not need to be changed except in extreme cases) default 5') + \
+                self.render_checkbox('rtsp_udp', 'RTSP UDP:', self.rtsp_udp, 'Use UDP protocol for RSTP streaming')
             ) + \
             self.render_config_section(
                 'Web UI',
-                self.render_text('uiport', 'UI port:', self.uiport) + \
-                self.render_select('uitheme', 'UI theme:', [ "dark", "light"], self.uitheme) + \
-                self.render_checkbox('twilighttimes', 'Twilight times:', self.twilighttimes) + \
-                self.render_checkbox('experimental', 'Experimental:', self.experimental) + \
-                self.render_checkbox('confirm', 'Commands Confirmation Dialog:', self.confirm) + \
-                self.render_checkbox('save_frames', 'Save star preview frames locally:', self.save_frames) + \
-                self.render_text('save_frames_dir', 'Save frames base directory:', self.save_frames_dir)
+                self.render_text('uiport', 'UI port:', self.uiport,'Port to use for connecting to the frontend (SSC) default 5432', required=True) + \
+                self.render_select('uitheme', 'UI theme:', [ "dark", "light"], self.uitheme, 'Theme to use for the frontend') + \
+                self.render_checkbox('experimental', 'Experimental:', self.experimental, 'Show experimental features (Only recommeded for experienced users)') + \
+                self.render_checkbox('confirm', 'Commands Confirmation Dialog:', self.confirm, 'Enable/Disable the Commands page confirmation dialog') + \
+                self.render_checkbox('save_frames', 'Save star preview frames locally:', self.save_frames, 'Save frames received on live page when in preview mode') + \
+                self.render_text('save_frames_dir', 'Save frames base directory:', self.save_frames_dir, 'Location to save preview frames (. is current directory)') + \
+                self.render_text('loading_gif', 'Loading gif:', self.loading_gif, 'Filename of loading gif to use on live view page')
             ) + \
             self.render_config_section(
                 'Server',
-                self.render_text('location', 'Location:', self.location) + \
-                self.render_checkbox('verbose_driver_exceptions', 'Verbose driver exceptions:', self.verbose_driver_exceptions)
+                self.render_text('location', 'Location:', self.location, 'Descriptor for when remote access becomes available') + \
+                self.render_checkbox('verbose_driver_exceptions', 'Verbose driver exceptions:', self.verbose_driver_exceptions, 'Give more information upon driver errors')
             ) + \
             self.render_config_section(
                 'Device',
-                self.render_checkbox('can_reverse', 'Can reverse:', self.can_reverse) + \
-                self.render_text('step_size', 'Step size:', self.step_size) + \
-                self.render_text('steps_per_sec', 'Steps per second:', self.steps_per_sec)
+                self.render_checkbox('can_reverse', 'Can reverse:', self.can_reverse, 'Not used at this time') + \
+                self.render_text('step_size', 'Step size:', self.step_size, 'Not used at this time') + \
+                self.render_text('steps_per_sec', 'Steps per second:', self.steps_per_sec, 'Not used at this time')
             ) + \
             self.render_config_section(
                 'Logging',
-                self.render_select('log_level', 'Log level:', log_levels, logging.getLevelName(self.log_level)) + \
-                self.render_text('log_prefix', 'Log prefix:', self.log_prefix) + \
-                self.render_checkbox('log_to_stdout', 'Log to stdout:', self.log_to_stdout) + \
-                self.render_text('max_size_mb', 'Max log size in MB:', self.max_size_mb) + \
-                self.render_text('num_keep_logs', 'Number of logs to keep:', self.num_keep_logs) + \
-                self.render_checkbox('log_events_in_info', 'Log events in INFO:', self.log_events_in_info)
+                self.render_select('log_level', 'Log level:', log_levels, logging.getLevelName(self.log_level), 'Level of logging, default INFO') + \
+                self.render_text('log_prefix', 'Log prefix:', self.log_prefix,'Optional prefix to add to logfiles') + \
+                self.render_checkbox('log_to_stdout', 'Log to stdout:', self.log_to_stdout, 'Log to the console as well as the logfile') + \
+                self.render_text('max_size_mb', 'Max log size in MB:', self.max_size_mb, 'Maximum size of logfile before starting a new one') + \
+                self.render_text('num_keep_logs', 'Number of logs to keep:', self.num_keep_logs, 'Number of logfiles to keep before deleting the oldest') + \
+                self.render_checkbox('log_events_in_info', 'Log events in INFO:', self.log_events_in_info, 'Log INFO events')
             ) + \
             self.render_config_section(
                 'Seestar Initialization',
-                self.render_checkbox('init_save_good_frames', 'Save good frames:', self.init_save_good_frames) + \
-                self.render_checkbox('init_save_all_frames', 'Save all frames:', self.init_save_all_frames) + \
-                self.render_text('init_lat', 'Latitude:', self.init_lat) + \
-                self.render_text('init_long', 'Longitude:', self.init_long) + \
-                self.render_text('init_gain', 'Gain:', self.init_gain) + \
-                self.render_text('init_expo_preview_ms', 'Exposure preview ms:', self.init_expo_preview_ms) + \
-                self.render_text('init_expo_stack_ms', 'Exposure stack ms:', self.init_expo_stack_ms) + \
-                self.render_checkbox('init_dither_enabled', 'Dither enabled:', self.init_dither_enabled) + \
-                self.render_text('init_dither_length_pixel', 'Dither length pixels:', self.init_dither_length_pixel) + \
-                self.render_text('init_dither_frequency', 'Dither frequency:', self.init_dither_frequency) + \
-                self.render_checkbox('init_activate_LP_filter', 'Activate LP filter:', self.init_activate_LP_filter) + \
-                self.render_text('init_dew_heater_power', 'Dew heater power:', self.init_dew_heater_power) + \
-                self.render_text('scope_aim_lat', 'Scope aim latitude:', self.scope_aim_lat) + \
-                self.render_text('scope_aim_lon', 'Scope aim longitude:', self.scope_aim_lon) + \
-                self.render_checkbox('is_EQ_mode', 'Scope in EQ Mode:', self.is_EQ_mode)
-            )
+                self.render_checkbox('init_save_good_frames', 'Save good frames:', self.init_save_good_frames, 'Save all good frames') + \
+                self.render_checkbox('init_save_all_frames', 'Save all frames:', self.init_save_all_frames, 'Save all frames, including ones rejected for stacking') + \
+                self.render_text('init_lat', 'Latitude:', self.init_lat, 'Your Latitude in decimal format') + \
+                self.render_text('init_long', 'Longitude:', self.init_long, 'Your Longitude in decimal format') + \
+                self.render_text('init_gain', 'Gain:', self.init_gain, 'Gain to use when initially turning on') + \
+                self.render_text('init_expo_preview_ms', 'Exposure preview ms:', self.init_expo_preview_ms, 'Exsposure length for images used in preview mode, in milliseconds') + \
+                self.render_text('init_expo_stack_ms', 'Exposure stack ms:', self.init_expo_stack_ms, 'Exposure length used in images to stack, in milliseconds') + \
+                self.render_checkbox('init_dither_enabled', 'Dither enabled:', self.init_dither_enabled, 'Enable / Disable Dithering') + \
+                self.render_text('init_dither_length_pixel', 'Dither length pixels:', self.init_dither_length_pixel, 'Number of pixels to move each dithering movement') + \
+                self.render_text('init_dither_frequency', 'Dither frequency:', self.init_dither_frequency, 'Number of frames between dithering movements') + \
+                self.render_checkbox('init_activate_LP_filter', 'Activate LP filter:', self.init_activate_LP_filter, 'Switch on Light Pollution Filter') + \
+                self.render_text('init_dew_heater_power', 'Dew heater power:', self.init_dew_heater_power, 'Dew heater power level, 0 - 100') + \
+                self.render_text('scope_aim_lat', 'Scope aim latitude:', self.scope_aim_lat, 'Latitude to move the scope to for the startup sequence') + \
+                self.render_text('scope_aim_lon', 'Scope aim longitude:', self.scope_aim_lon, 'Longitude to move thescope to for the startup sequence') + \
+                self.render_checkbox('is_EQ_mode', 'Scope in EQ Mode:', self.is_EQ_mode, 'Is the scope in equitorial mode') + \
+                self.render_checkbox('init_guest_mode', 'Claim guest mode control:', self.init_guest_mode, 'Claim guest mode on init')
+            ) + \
+            self.render_config_section('Seestar Devices',self.render_seestars(),'seestar_devices')
+        return self._dict
 
 Config = _Config()

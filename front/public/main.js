@@ -80,8 +80,8 @@ async function fetchCoordinates() {
                 const elements = data.trim().split(/\s+/);
                 document.getElementById('ra').value = elements[0];
                 document.getElementById('dec').value = elements[1];
-                document.getElementById('useLpFilter').checked = false;
                 document.getElementById("useJ2000").checked = true;
+                document.getElementById('useLpFilter').checked = false;
                 if (elements[2] == 'on') 
                     document.getElementById('useLpFilter').checked = true;
             })
@@ -155,8 +155,8 @@ async function fetchCoordinates() {
                     
                     document.getElementById('ra').value = elements.ra;
                     document.getElementById('dec').value = elements.dec;
-                    document.getElementById('useLpFilter').checked = false;
                     document.getElementById("useJ2000").checked = true;
+                    document.getElementById('useLpFilter').checked = false;
                 };
             });
             break;
@@ -189,18 +189,18 @@ async function fetchCoordinates() {
                     cometData = JSON.parse(data);
                     if (cometData.length > 1) {
                         openItemModal(cometData, 'cometName').then(selectedComet => {
-                        document.getElementById('ra').value = selectedComet.ra;
-                        document.getElementById('dec').value = selectedComet.dec;
-                        document.getElementById('targetName').value = selectedComet.cometName;
-                        document.getElementById('useLpFilter').checked = false;
-                        document.getElementById("useJ2000").checked = true;
+                            document.getElementById('ra').value = selectedComet.ra;
+                            document.getElementById('dec').value = selectedComet.dec;
+                            document.getElementById('targetName').value = selectedComet.cometName;
+                            document.getElementById("useJ2000").checked = true;
+                            document.getElementById('useLpFilter').checked = false;
                         });
                     } else {
                         document.getElementById('ra').value = cometData.ra;
                         document.getElementById('dec').value = cometData.dec;
                         document.getElementById('targetName').value = cometData.cometName;
-                        document.getElementById('useLpFilter').checked = false;
                         document.getElementById("useJ2000").checked = true;
+                        document.getElementById('useLpFilter').checked = false;
                     };
                 
                 };
@@ -235,8 +235,8 @@ async function fetchCoordinates() {
                     starData = JSON.parse(data);
                         document.getElementById('ra').value = starData["ra"];
                         document.getElementById('dec').value = starData["dec"];
-                        document.getElementById('useLpFilter').checked = false;
                         document.getElementById("useJ2000").checked = true;
+                        document.getElementById('useLpFilter').checked = false;
                     };
             });
         break;
@@ -425,3 +425,151 @@ function handleItemSelection(item) {
     document.getElementById('useLpFilter').checked = false;
     document.getElementById("useJ2000").checked = true;
 }
+
+function addSeestar(){
+    var devicecount = document.getElementsByName('ss_name').length + 1; //parseInt(document.getElementById('devicecount') + 1);
+    var lastElement = document.getElementById(`device_div_${devicecount - 1}`);
+       
+    var insertBlock = `<div id="device_div_${devicecount}">
+                            <div class="col-sm-4 text-end">
+                                <label class="form-label">
+                                    <h3>Device number ${devicecount}</h3>
+                                </label>
+                            </div>
+                            <div class="row mb-3 align-items-center">
+                                <!-- Row -->
+                                <div class="col-sm-4 text-end">
+                                    <!-- Col -->
+                                    <label for="ss_name" class="form-label">Name</label>
+                                </div>
+                                <!-- Close Col -->
+                                <div class="col-sm-8 col-md-6">
+                                    <!-- Col -->
+                                    <input id="ss_name" name="ss_name" type="text" class="form-control" title="" value="" required>
+                                </div>
+                                <!-- Close Col -->
+                            </div>
+                            <!-- Close Row -->
+                            <div class="row mb-3 align-items-center">
+                                <!-- Row -->
+                                <div class="col-sm-4 text-end">
+                                    <!-- Col -->
+                                    <label for="ss_ip_address" class="form-label">IP Address</label>
+                                </div>
+                                <!-- Close Col -->
+                                <div class="col-sm-8 col-md-6">
+                                    <!-- Col -->
+                                    <input id="ss_ip_address" name="ss_ip_address" type="text" class="form-control" title="" value="" required>
+                                </div>
+                                <!-- Close Col -->
+                            </div>
+                            <!-- Close Row -->
+                            <div class="row mb-3 align-items-center">
+                                <!-- Row -->
+                                <div class="col-sm-4 text-end">
+                                    <!-- Col -->
+                                    <label for="ss_scope_aim_lat" class="form-label">
+                                    Aim Lat
+                                    </label>
+                                </div>
+                                <!-- Close Col -->
+                                <div class="col-sm-8 col-md-6">
+                                    <!-- Col -->
+                                    <input id="ss_scope_aim_lat" name="ss_scope_aim_lat" type="number" class="form-control" title="start up latitude in degrees -90 to 80" value="60.0" >
+                                </div>
+                                <!-- Close Col -->
+                            </div>
+                            <!-- Close Row -->
+                            <div class="row mb-3 align-items-center">
+                                <!-- Row -->
+                                <div class="col-sm-4 text-end">
+                                    <!-- Col -->
+                                    <label for="ss_scope_aim_lon" class="form-label">
+                                    Aim Long
+                                    </label>
+                                </div>
+                                <!-- Close Col -->
+                                <div class="col-sm-8 col-md-6">
+                                    <!-- Col -->
+                                    <input id="ss_scope_aim_lon" name="ss_scope_aim_lon" type="number" class="form-control" title="start up longitude in degrees 0 to 360" value="20.0" >
+                                </div>
+                                <!-- Close Col -->
+                            </div>
+                            <!-- Close Row -->
+                            <input id="ss_is_EQ_mode_hidden_${devicecount}" name="ss_is_EQ_mode" type="hidden" value="False">
+                            <div class="row mb-3 align-items-center">
+                                <!-- Checkbox Row -->
+                                <div class="col-sm-4 text-end">
+                                    <!-- Checkbox label -->
+                                    <label for="ss_is_EQ_mode_${devicecount}" class="form-label">
+                                    Is device in EQ mode
+                                    </label>
+                                </div>
+                                <!-- Close checkbox label -->
+                                <div class="col-sm-8 col-md-6">
+                                    <!-- Checkbox -->
+                                    <input id="ss_is_EQ_mode_${devicecount}" class="form-check-input" title="Is device in EQ mode" type="checkbox" onclick="NewCheckboxChange('ss_is_EQ_mode_hidden_${devicecount}')">
+                                </div>
+                                <!--Close checkbox -->
+                            </div>
+                            <!-- Close checkbox row -->
+                            <div class="row mb-3 align-items-center">
+                                <!-- Checkbox Row -->
+                                <div class="col-sm-4 text-end">
+                                    <!-- Checkbox label -->
+                                    <label for="delete_${devicecount}" class="form-label">
+                                    Delete device
+                                    </label>
+                                </div>
+                                <!-- Close checkbox label -->
+                                <div class="col-sm-8 col-md-6">
+                                    <!-- Checkbox -->
+                                    <input id="delete_${devicecount}" name="delete_${devicecount}" class="form-check-input" title="" type="checkbox" >
+                                </div>
+                                <!--Close checkbox -->
+                            </div>
+                            <!-- Close checkbox row -->                        
+                        </div>
+                            `;
+    lastElement.insertAdjacentHTML('afterend', insertBlock);
+}
+
+
+function NewCheckboxChange(element) {
+    hidden = document.getElementById(element);
+    if (hidden.value == "True") { 
+        hidden.value = "False";
+    } else {
+        hidden.value = "True";
+     }
+};
+
+function delSeestar() {
+    // Get all the checkboxes
+    var elements = document.querySelectorAll('[id^=delete_]');
+    for (const cb of elements) {
+        if (cb.checked == true) {
+            var number = cb.name.split('_')[1];
+            var deviceDiv = document.getElementById('device_div_' + number);
+            deviceDiv.remove(deviceDiv);
+        }
+    }
+
+}
+
+// Create event listener to monitor the seestar checkboxes.  Upon change of the checkbox state,
+// update the associated hidden checkbox with True / False so we have somthing to send back upon unchecked.
+
+document.querySelectorAll('[id^=ss_is_EQ_mode_]:not([id^=is_EQ_mode_hidden_])').forEach(function(element) { 
+    element.addEventListener('change', function(event) {
+        // Directly access the changed element
+        var changedElement = event.target;
+        var elementNumber = changedElement.id.split("_").pop();
+        var hiddenInput = document.getElementById('ss_is_EQ_mode_hidden_' + elementNumber);
+
+        // Correctly update the hidden input value
+        hiddenInput.value = changedElement.checked ? 'True' : 'False';
+    });
+});
+
+
