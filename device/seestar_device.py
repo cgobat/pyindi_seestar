@@ -15,6 +15,9 @@ from blinker import signal
 import geomag
 
 import numpy as np
+import random
+from json import JSONEncoder
+
 
 import tzlocal
 import queue
@@ -22,8 +25,13 @@ import pydash
 from device.config import Config
 from device.version import Version # type: ignore
 from device.seestar_util import Util
+from device.event_callbacks import *
 
 from collections import OrderedDict
+
+from astropy.coordinates import SkyCoord, EarthLocation, AltAz
+from astropy.time import Time
+import astropy.units as u
 
 class FixedSizeOrderedDict(OrderedDict):
     def __init__(self, *args, maxsize=None, **kwargs):
@@ -35,6 +43,11 @@ class FixedSizeOrderedDict(OrderedDict):
             self.popitem(last=False)  # Remove the oldest item
         super().__setitem__(key, value)
 
+class DequeEncoder(JSONEncoder):
+    def default(self, obj):
+       if isinstance(obj, collections.deque):
+          return list(obj)
+       return JSONEncoder.default(self, obj)
 
 class Seestar:
     def __new__(cls, *args, **kwargs):
@@ -71,10 +84,13 @@ class Seestar:
         self.utcdate = time.time()
         self.firmware_ver_int: int = 0
 
+        self.event_callbacks : list[EventCallback] = []
+
         self.mosaic_thread: Optional[threading.Thread] = None
         self.scheduler_thread: Optional[threading.Thread] = None
         self.schedule: dict = {}
         self.schedule['version'] = 1.0
+        self.schedule['Event'] = "Scheduler"
         self.schedule['schedule_id'] = str(uuid.uuid4())
         self.schedule['list'] = collections.deque()
         self.schedule['state'] = "stopped"
@@ -86,8 +102,20 @@ class Seestar:
         self.event_state: dict = {}
         self.update_scheduler_state_obj({}, result=0)
 
+
+        self.cur_equ_offset_alt = None  # from 3ppa
+        self.cur_equ_offset_az = None  # from 3ppa
+
+        self.is_in_plate_solve_loop = False
+        self.plate_solve_state = "fail"
         self.cur_solve_RA: float = -9999.0  #
         self.cur_solve_Dec: float = -9999.0
+        self.first_plate_solve_altaz = None    # for blind plate solve logic
+        self.first_plate_solve_RA = None
+        self.first_plate_solve_Dec = None
+        self.first_obs_time = None
+        self.site_altaz_frame = None
+
         self.connect_count: int = 0
         self.below_horizon_dec_offset: float = 0  # we will use this to work around below horizon. This value will ve used to fool Seestar's star map
         self.safe_dec_for_offset: float = 10.0  # declination angle in degrees as the lower limit for dec values before below_horizon logic kicks in
@@ -114,8 +142,9 @@ class Seestar:
         return f"{type(self).__name__}(host={self.host}, port={self.port})"
 
     def update_scheduler_state_obj(self, item_state, result = 0):
-        self.event_state["scheduler"]  = {"schedule_id": self.schedule['schedule_id'], "state":self.schedule['state'],
+        self.event_state["scheduler"]  = {"Event":"Scheduler", "schedule_id": self.schedule['schedule_id'], "state":self.schedule['state'],
                                             "item_number": self.schedule["item_number"], "cur_scheduler_item": item_state , "result":result}
+        self.logger.info(f"scheduler event state: {self.event_state['scheduler']}")
 
     def heartbeat(self):  # I noticed a lot of pairs of test_connection followed by a get if nothing was going on
         #    json_message("test_connection")
@@ -156,6 +185,39 @@ class Seestar:
         self.is_connected = False
         self.socket_force_close()
 
+    def send_udp_intro(self):
+        # {"id":1,"method":"scan_iscope","params":""}
+        try:
+            # Create a UDP socket
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            udp_port = 4720
+            # Enable broadcast option
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            sock.settimeout(1.0)  # Timeout in seconds
+
+            addr = (self.host, udp_port)
+            # Send the message to the broadcast address
+            message = {"id":1,"method":"scan_iscope","params":""}
+            message_payload = json.dumps(message).encode()
+            self.logger.info(f"UDP: Sending broadcast message: {message_payload} on port {udp_port}")
+            sock.sendto(message_payload, addr)
+
+            while True:
+                try:
+                    # Listen for incoming messages
+                    data, addr = sock.recvfrom(1024)  # Buffer size is 1024 bytes
+                    self.logger.info(f"UDP: Received message from {addr}: {data.decode()}")
+                except socket.timeout:
+                    self.logger.info("UDP: No more responses received.")
+                    break
+
+        except Exception as e:
+            self.logger.info(f"Error sending broadcast message: {e}")
+
+        finally:
+            # Close the socket
+            sock.close()
+
     def reconnect(self):
         if self.is_connected:
             return True
@@ -164,6 +226,9 @@ class Seestar:
             self.logger.info(f"RECONNECTING {self.device_name}")
 
             self.disconnect()
+
+            # send a udp message to satisfy seestar's guest mode to gain control properly
+            self.send_udp_intro()
 
             # note: the below isn't thread safe!  (Reconnect can be called from different threads.)
             self.s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -233,6 +298,12 @@ class Seestar:
             self.heartbeat()
             time.sleep(3)
 
+    def request_plate_solve_for_BPA(self):
+        # wait 1s before making the request to ease congestion
+        time.sleep(1)
+        tmp = self.send_message_param_sync({"method":"start_solve"})
+        self.logger.info(f"requested plate solve for BPA: {tmp}")
+
     def receive_message_thread_fn(self):
         msg_remainder = ""
         while self.is_watch_events:
@@ -282,14 +353,30 @@ class Seestar:
                         # {'Event': 'PlateSolve', 'Timestamp': '21778.539366227', 'state': 'fail', 'error': 'solve failed', 'code': 251, 'lapse_ms': 30985, 'route': []}
 
                         if event_name == 'PlateSolve':
-                            if 'result' in parsed_data and 'ra_dec' in parsed_data['result']:
-                                self.logger.info("Plate Solve Succeeded")
+                            if 'result' in parsed_data and parsed_data['state'] == 'complete' and 'ra_dec' in parsed_data['result']:
                                 self.cur_solve_RA = parsed_data['result']['ra_dec'][0]
                                 self.cur_solve_Dec = parsed_data['result']['ra_dec'][1]
+                                self.logger.info(f"Current plate solve position: {self.cur_solve_RA}, {self.cur_solve_Dec}")
+                                # record first good plate solve for blind polar alignment logic
+                                if self.first_plate_solve_altaz == None and self.site_altaz_frame is not None:
+                                    self.first_obs_time = Time.now()
+                                    self.first_plate_solve_altaz = self.get_altaz_from_eq(self.cur_solve_RA, self.cur_solve_Dec, self.first_obs_time)
+                                    self.logger.info(f"set first plate solve position: {self.cur_solve_RA}, {self.cur_solve_Dec}")
+                                    self.first_plate_solve_RA = self.cur_solve_RA
+                                    self.first_plate_solve_Dec = self.cur_solve_Dec
+                                self.plate_solve_state = "complete"
+                                # repeat plate solve if we are in PA refinement loop
+                                if self.is_in_plate_solve_loop:
+                                    threading.Thread(name=f"plate_solve:{self.device_name}", target=lambda: self.request_plate_solve_for_BPA()).start()
                             elif parsed_data['state'] == 'fail':
+                                self.plate_solve_state = "fail"
                                 self.logger.info("Plate Solve Failed")
-                                self.cur_solve_RA = 0
-                                self.cur_solve_Dec = 0
+                                if self.is_in_plate_solve_loop:
+                                    threading.Thread(name=f"plate_solve:{self.device_name}", target=lambda: self.request_plate_solve_for_BPA()).start()
+
+                        for cb in self.event_callbacks:
+                            if event_name in cb.fireOnEvents():
+                                cb.eventFired(self, parsed_data)
                         #else:
                         #    self.logger.debug(f"Received event {event_name} : {data}")
 
@@ -356,7 +443,11 @@ class Seestar:
         return self.response_dict[cur_cmdid]
 
     def get_event_state(self, params=None):
+        self.event_state["scheduler"]["Event"] = "Scheduler"
         self.event_state["scheduler"]["state"] = self.schedule["state"]
+        if "3PPA" in self.event_state:
+            self.event_state["3PPA"]["eq_offset_alt"] = self.cur_equ_offset_alt
+            self.event_state["3PPA"]["eq_offset_az"] = self.cur_equ_offset_az
         if params is not None and 'event_name' in params:
             event_name = params['event_name']
             if event_name in self.event_state:
@@ -366,6 +457,99 @@ class Seestar:
         else:
             result = self.event_state
         return self.json_result("get_event_state", 0, result)
+
+    # return if this device can control as master
+    def is_client_master(self):
+        client_master = True # Assume master for older firmware
+        if 'Client' in self.event_state:
+            client_master = self.event_state['Client'].get('is_master', True)
+        return client_master
+
+    def start_plate_solve_loop(self):
+        if not self.is_client_master():
+            return ({"ok":False, "error":"Alp is not the device controller. Grab control first."})
+
+        elif self.cur_equ_offset_alt == None:
+            return ({"ok":False, "error":"Need to perform 3 point polar alignment in start up sequence first."})
+
+        elif self.schedule['state'] == "stopped" or self.schedule['state'] == 'complete':
+            self.schedule['state'] = "working"
+            self.first_plate_solve_altaz = None
+            self.is_in_plate_solve_loop = True
+            tmp = self.send_message_param_sync({"method":"start_solve"})
+            self.logger.info("start plate solve loop")
+            return({"ok":True, "error":""})
+        else:
+            self.is_in_plate_solve_loop = False
+            self.logger.warn("scheduler state is running, cannot start plate solve loop")
+            return({"ok":False, "error":"scheduler state is running, cannot start plate solve loop"})
+
+    def stop_plate_solve_loop(self):
+        if self.schedule['state'] != "working":
+            self.logger.warn("Error: there is no active plate solve loop to stop.")
+            return({"ok":False, "error":"there is no active plate solve loop to stop."})
+        self.is_in_plate_solve_loop = False
+        self.schedule['state'] = "complete"
+        self.logger.info("Stopped plate solve loop")
+        return({"ok":True, "error":""})
+
+    def get_altaz_from_eq(self, in_ra, in_dec, obs_time):
+        if self.site_altaz_frame == None:
+            self.logger.warn("SCC has a rouge thread trying to call BPA error!")
+            return [9999.9, 9999.9]
+        radec = Util.parse_coordinate(is_j2000=False, in_ra=in_ra, in_dec=in_dec)
+        # Convert RA/Dec to Alt/Az
+        altaz = radec.transform_to(AltAz(obstime=obs_time, location=self.site_altaz_frame))
+        self.logger.info(f"coord in az-alt: {altaz.az.deg}, {altaz.alt.deg}")
+        return [altaz.alt.deg, altaz.az.deg]
+
+    def get_pa_error(self, param):
+        max_error = 9999.9
+
+#todo mock data only
+#        if self.cur_equ_offset_alt == None:
+#            self.cur_equ_offset_alt = 0.0
+#        else:
+#            self.cur_equ_offset_alt += (2*random.random() - 1) * 0.3
+#        if self.cur_equ_offset_az == None:
+#            self.cur_equ_offset_az = 0.0
+#        else:
+#            self.cur_equ_offset_az += (2*random.random() - 1) * 0.3
+
+#        return({"pa_error_alt" : self.cur_equ_offset_alt,
+#                "pa_error_az" : self.cur_equ_offset_az})
+
+        if self.first_plate_solve_altaz == None:
+            return({"pa_error_alt" : max_error, "pa_error_az" : max_error})
+
+        if self.plate_solve_state == "working":
+            self.logger.warn("Warning: Alignment logic is still trying to platesolve. Data is not ready.")
+            return({"pa_error_alt" : max_error, "pa_error_az" : max_error})
+        elif self.cur_equ_offset_alt == None:
+            self.logger.warn("Warning: Polar alignment has not been completed yet. Data is not ready.")
+            return({"pa_error_alt" : max_error, "pa_error_az" : max_error})
+
+
+        cur_solve_altaz = self.get_altaz_from_eq(self.cur_solve_RA, self.cur_solve_Dec, self.first_obs_time)
+
+        # note seestar returns equ offset as [az, alt], bad convention!
+        error_alt = self.cur_equ_offset_alt - (cur_solve_altaz[0] - self.first_plate_solve_altaz[0])
+        error_az = self.cur_equ_offset_az  - (cur_solve_altaz[1] - self.first_plate_solve_altaz[1])
+
+        self.logger.info(f"before: az:{self.first_plate_solve_altaz[0]:3.4f}, alt:{self.first_plate_solve_altaz[1]:3.4f}")
+        self.logger.info(f"after : az:{cur_solve_altaz[0]:3.4f}, alt:{cur_solve_altaz[1]:3.4f}")
+
+        self.logger.info(f"PA eq_offset: {self.cur_equ_offset_alt:3.4f}, {self.cur_equ_offset_az:3.4f}")
+        self.logger.info(f"pa error    : {error_alt:3.4f}, {error_az:3.4f}")
+        self.logger.info("")
+
+        if error_alt > max_error:
+            error_alt = max_error
+
+        if error_az > max_error:
+            error_az = max_error
+
+        return({"pa_error_alt" : error_alt, "pa_error_az" : error_az})
 
 
     def set_setting(self, x_stack_l, x_continuous, d_pix, d_interval, d_enable, l_enhance, auto_af=False, stack_after_goto=False):
@@ -383,8 +567,15 @@ class Seestar:
         #    data = {"id":cmdid, "method":"set_setting", "params":{"exp_ms":{"stack_l":x_stack_l,"continuous":x_continuous}, "stack_dither":{"pix":d_pix,"interval":d_interval,"enable":d_enable}, "stack_lenhance":l_enhance, "heater_enable":heater_enable}}
         data = {"method": "set_setting", "params": {"exp_ms": {"stack_l": x_stack_l, "continuous": x_continuous},
                                                     "stack_dither": {"pix": d_pix, "interval": d_interval,
-                                                                     "enable": d_enable}, "stack_lenhance": l_enhance}}
+                                                                     "enable": d_enable}, "stack_lenhance": l_enhance,
+                                                                     "auto_3ppa_calib": True,
+                                                                     "auto_power_off" : False}}
         result = self.send_message_param_sync(data)
+        self.logger.info(f"set setting result: {result}")
+
+        response = self.send_message_param_sync({"method":"get_setting"})
+        self.logger.info(f"get setting response: {response}")
+
         time.sleep(2)  # to wait for filter change
         return result
 
@@ -430,15 +621,12 @@ class Seestar:
         except:
             return False
 
+    # synchronise call. Will return only if there's result
     def goto_target(self, params):
         if self.is_goto():
             self.logger.info("Failed to goto target: mount is in goto routine.")
-            return {"result":"Failed to goto target: mount is in goto routine."}
+            return False
         self.mark_goto_status_as_start()
-        threading.Thread(name=f"goto-target-thread:{self.device_name}", target=lambda: self.goto_target_thread(params)).start()
-        return {"result":0}
-
-    def goto_target_thread(self, params):
 
         is_j2000 = params['is_j2000']
         in_ra = params['ra']
@@ -455,20 +643,25 @@ class Seestar:
                 msg = f"Failed. You tried to geto to a target [ {in_ra}, {in_dec} ] that seems to be too low for your location at lat={Config.init_lat}"
                 self.logger.warn(msg)
                 self.mark_goto_status_as_stopped()
-                return
+                return False
 
             safe_dec_offset = -in_dec+self.safe_dec_for_offset
             if self.below_horizon_dec_offset > 0 and in_dec > self.safe_dec_for_offset:
                 result = self.reset_below_horizon_dec_offset()
+                if result == False:
+                    self.logger.warn("Failed to reset dec offset before applying a large offset")
+                    self.mark_goto_status_as_stopped()
+                    return False
+
             elif safe_dec_offset > self.below_horizon_dec_offset:
                 result = self.set_below_horizon_dec_offset(safe_dec_offset, in_dec)
-
-            if result != True:
-                self.logger.warn("Failed to set or reset horizontal dec offset. Goto will not proceed.")
-                self.mark_goto_status_as_stopped()
-                return
+                if result == False:
+                    self.logger.warn("Failed to set or reset horizontal dec offset. Goto will not proceed.")
+                    self.mark_goto_status_as_stopped()
+                    return False
 
         if self.below_horizon_dec_offset == 0:
+            self.logger.info(f"going to target with normal logic: {self.below_horizon_dec_offset }")
             self.is_below_horizon_goto_method = False
             data = {}
             data['method'] = 'iscope_start_view'
@@ -480,11 +673,23 @@ class Seestar:
             params['lp_filter'] = False
             data['params'] = params
             self.send_message_param_sync(data)
-            return
+            result = self.wait_end_op("goto_target")
+            return result
+
         else:
+            self.logger.info(f"going to target with below horizon logic: {self.below_horizon_dec_offset }")
             # do the same, but when trying to center on target, need to implement ourselves to platesolve correctly to compensate for the dec offset
             self.goto_target_with_dec_offset_async(target_name, in_ra, in_dec)
-            return
+            # need to check if we have a custom goto running, and make sure it is finished before stacking
+            while self.custom_goto_state == "start" or self.custom_goto_state == "working" or self.custom_goto_state == "fail":     #fix Issue of below horizon targets keep on imaging even if failed to goto
+                if self.custom_goto_state == "fail":
+                    self.logger.warn("Failed to goto the target with custom goto logic before stacking. Will stop here.")
+                    self.custom_goto_state = "stopped"
+                    return False
+                time.sleep(3)
+            self.custom_goto_state = "stopped"
+            time.sleep(2)
+            return True
 
     # {"method":"scope_goto","params":[1.2345,75.0]}
     def _slew_to_ra_dec(self, params):
@@ -536,7 +741,7 @@ class Seestar:
 
     def reset_below_horizon_dec_offset(self):
         if not self.is_EQ_mode:
-            return
+            return False
 
         old_ra = self.ra
         old_dec = self.dec
@@ -635,11 +840,16 @@ class Seestar:
                     break
         # give extra time to settle focuser
         time.sleep(2)
-        self.logger.info("auto_focus completed")
+        self.logger.info(f"auto_focus completed with result {result}")
+        if result == True:
+            self.event_state["AutoFocus"]["state"] = "complete"
+        else:
+            self.event_state["AutoFocus"]["state"] = "fail"
         return result
 
     def start_3PPA(self):
         self.logger.info("start 3 point polar alignment...")
+        self.first_plate_solve_altaz = None
         result = self.send_message_param_sync({"method": "start_polar_align"})
         if 'error' in result:
             self.logger.error("Faild to start polar alignment: %s", result)
@@ -663,11 +873,16 @@ class Seestar:
 #            response = response["result"]
 #            if "3PPA" not in response or ("3PPA" in response and response["3PPA"]["state"] == "fail"):
             response = self.send_message_param_sync({"method":"get_device_state"})
-            self.logger.info(f"get 3PPA state to determine how to proceede: {response}")
+            self.logger.info(f"get 3PPA state to determine how to proceed: {response}")
 
             response = response["result"]["setting"]
+
             is_3PPA = True
-            if "offset_deg_3ppa" not in response:
+
+            #if "offset_deg_3ppa" not in response:
+            # testing. Trying to verify if I can just go straight to 3ppa instead
+
+            if False:
                 result = self.start_stack({"restart":True, "gain": Config.init_gain})
                 is_3PPA = False
             else:
@@ -680,20 +895,49 @@ class Seestar:
                         event_state = self.event_state["3PPA"]
                         if "state" in event_state and (event_state["state"] == "fail"):
                             self.logger.info(f"3PPA failed: {event_state}.")
-                            if not is_3PPA:
-                                response = self.send_message_param_sync({"method":"iscope_stop_view","params":{"stage":"AutoGoto"}})
-                                self.logger.info(response)
+                            #if not is_3PPA:
+                            response = self.send_message_param_sync({"method":"iscope_stop_view","params":{"stage":"AutoGoto"}})
+                            self.logger.info(response)
+                            time.sleep(1)
                             result = False
                             break
                         elif "percent" in event_state:
-                            if event_state["percent"] >= 99.0 or event_state["state"] == "complete":
-                                self.logger.info("3PPA reached 100%. Will stop return to origin now.")
+                            if event_state["percent"] >= 90.0 or event_state["state"] == "complete":
+                                if "equ_offset" in event_state:
+                                    self.logger.info(f"calculating error using equ_offset and firmware version {self.firmware_ver_int}")
+                                    result = True
+                                    # bad ZWO. It returns [az, alt] for alt-az error
+                                    self.cur_equ_offset_az = event_state["equ_offset"][0]
+                                    self.cur_equ_offset_alt = event_state["equ_offset"][1]
+                                    if self.firmware_ver_int < 2368:
+                                        self.cur_equ_offset_alt -= 90.0 - self.site_latitude
+                                        self.cur_equ_offset_alt = -self.cur_equ_offset_alt
+                                        self.cur_equ_offset_az = -self.cur_equ_offset_az
+                                    self.logger.info(f"3PPA equ offset-- firmware:{self.firmware_ver_int}, alt:{self.cur_equ_offset_alt}, az:{self.cur_equ_offset_az}")
+                                elif "offset" in event_state:
+                                    self.logger.info(f"calculating error using offset and firmware version {self.firmware_ver_int}")
+                                    result = True
+                                    # bad ZWO. It returns [az, alt] for alt-az error
+                                    self.cur_equ_offset_az = event_state["offset"][0]
+                                    self.cur_equ_offset_alt = event_state["offset"][1]
+                                    if self.firmware_ver_int < 2368:
+                                        self.cur_equ_offset_alt -= 90.0 - self.site_latitude
+                                        self.cur_equ_offset_alt = -self.cur_equ_offset_alt
+                                        self.cur_equ_offset_az = -self.cur_equ_offset_az
+                                    self.logger.info(f"3PPA equ offset-- firmware:{self.firmware_ver_int}, alt:{self.cur_equ_offset_alt}, az:{self.cur_equ_offset_az}")
+                                else:
+                                    result = False
+                                    self.cur_equ_offset_alt = None
+                                    self.cur_equ_offset_az = None
+                                    self.logger.warn(f"did not find eq offset data: {event_state}. Will stop now.")
+                                self.logger.info("3PPA finished 3rd pt. Will stop return to origin now.")
                                 if is_3PPA:
                                     response = self.send_message_param_sync({"method":"stop_polar_align"})
                                 else:
                                     response = self.send_message_param_sync({"method":"iscope_stop_view","params":{"stage":"AutoGoto"}})
+                                    time.sleep(1)
                                 self.logger.info(response)
-                                result = True
+
                                 break
                         elif "state" in event_state and (event_state["state"] == "cancel"):
                             self.logger.info("Should not found a cancel state for 3PPA since we explicitly cancel only when we past 100% plate solve")
@@ -719,6 +963,12 @@ class Seestar:
     def try_dark_frame(self):
         self.logger.info("start dark frame measurement...")
         self.event_state["DarkLibrary"] = {"state":"working"}
+        result = self.send_message_param_sync({"method": "iscope_stop_view"})
+
+        # seem like there's a side effect here of autofocus state was set to "cancel" after stop view
+        time.sleep(1)
+        self.event_state["AutoFocus"]["state"] = "complete"
+
         result = self.send_message_param_sync({"method": "start_create_dark"})
         if 'error' in result:
             self.logger.error("Faild to start create darks: %s", result)
@@ -730,6 +980,7 @@ class Seestar:
         if result == True:
             response = self.send_message_param_sync({"method":"iscope_stop_view","params":{"stage":"Stack"}})
             self.logger.info(f"Response from stop stack after dark frame measurement: {response}")
+            time.sleep(1)
         else:
             self.logger.warn("Create dark frame data failed.")
         return result
@@ -830,27 +1081,27 @@ class Seestar:
             self.set_target_name(target_name)
             # repeat plate solve and adjust position as needed
             threading.Thread(name=f"goto-dec-offset-thread:{self.device_name}", target=lambda: self.auto_center_thread(target_ra, target_dec)).start()
-            return True
+            return
         else:
             self.logger.info("Failed to slew")
-            return False
+            self.custom_goto_state = "fail"
+            return
 
     # after we goto_ra_dec, we can do a platesolve and refine until we are close enough
     def auto_center_thread(self, target_ra, target_dec):
         self.logger.info("In auto center logic...")
-        self.cur_solve_RA = -9999.0
-        self.cur_solve_Dec = -9999.0
         self.custom_goto_state = "working"
         search_count = 0
         while self.schedule['state'] != "stopping" and self.custom_goto_state == "working":
             # wait a bit to ensure we have preview image data
             time.sleep(1)
-            self.send_message_param({"method": "start_solve"})
-            # reset it immediately so the other wather thread can update the solved position
             self.cur_solve_RA = -9999.0
             self.cur_solve_Dec = -9999.0
+            self.plate_solve_state = "working"
+            self.send_message_param({"method": "start_solve"})
+
             # if we have not platesolve yet, then repeat
-            while self.cur_solve_RA < -1000:
+            while self.plate_solve_state == "working":
                 if self.schedule['state'] == "stopping" or self.custom_goto_state != "working":
                     self.logger.info("auto center thread stopped because the scheduler was requested to stop")
                     self.custom_goto_state = "stopped"
@@ -858,9 +1109,10 @@ class Seestar:
                 time.sleep(1)
 
             # if we failed platesolve:
-            if self.cur_solve_RA == 0 and self.cur_solve_Dec == 0:
+            if self.plate_solve_state == "fail":
                 if search_count > 5:
                     self.custom_goto_state = "fail"
+                    search_count = 0
                     self.logger.warn(f"auto center failed after {search_count} tries.")
                     return
                 else:
@@ -893,6 +1145,14 @@ class Seestar:
     def start_stack(self, params={"gain": Config.init_gain, "restart": True}):
         stack_gain = params["gain"]
         result = self.send_message_param_sync({"method": "iscope_start_stack", "params": {"restart": params["restart"]}})
+        if "error" in result:
+            #try again:
+            self.logger.warn("Failed to start stack. Trying again...")
+            time.sleep(2)
+            result = self.send_message_param_sync({"method": "iscope_start_stack", "params": {"restart": params["restart"]}})
+            if "error" in result:
+                self.logger.error("Failed to start stack: %s", result)
+                return False
         self.logger.info(result)
         result = self.send_message_param_sync({"method": "set_control_value", "params": ["gain", stack_gain]})
         self.logger.info(result)
@@ -958,9 +1218,10 @@ class Seestar:
 
             loc_data = {}
             loc_param = {}
-            # special loc for south pole: (-90, 0)
-            if ('lat' not in params or 'lon' not in params) or (params['lat'] <= 0 and params['lon'] <= 0):  # special case of (0,0,) will use the ip address to estimate the location
-                if Config.init_lat <= 0 and Config.init_long <= 0:
+            # special case of (0,0) will use the ip address to estimate the location
+            has_latlon = 'lat' in params and 'lon' in params
+            if not has_latlon or (params['lat'] == 0 and params['lon'] == 0):
+                if (has_latlon and params['lat'] == 0 and params['lon'] == 0) or (Config.init_lat == 0 and Config.init_long == 0):
                     coordinates = Util.get_current_gps_coordinates()
                     if coordinates is not None:
                         latitude, longitude = coordinates
@@ -973,6 +1234,9 @@ class Seestar:
                 Config.init_lat = params['lat']
                 Config.init_long = params['lon']
 
+            # reset the site location frame for refining polar alignments
+            self.site_altaz_frame = EarthLocation(lat=Config.init_lat*u.deg, lon=Config.init_long*u.deg, height=10*u.m)
+
             loc_param['lat'] = Config.init_lat
             loc_param['lon'] = Config.init_long
             loc_param['force'] = True
@@ -983,7 +1247,9 @@ class Seestar:
             self.logger.info("verify datetime string: %s", date_data)
             self.logger.info("verify location string: %s", loc_data)
 
-            self.send_message_param_sync({"method": "pi_is_verified"})
+            response = self.send_message_param_sync({"method": "pi_is_verified"})
+            self.logger.info(f"pi_is_verified response: {response}")
+
             msg = f"Setting location to {Config.init_lat}, {Config.init_long}"
             self.logger.info(msg)
             self.event_state["scheduler"]["cur_scheduler_item"]["action"]=msg
@@ -999,10 +1265,16 @@ class Seestar:
             self.set_setting(Config.init_expo_stack_ms, Config.init_expo_preview_ms, Config.init_dither_length_pixel,
                             Config.init_dither_frequency, Config.init_dither_enabled, Config.init_activate_LP_filter)
 
-            self.send_message_param_sync({"method": "pi_output_set2", "params":{"heater":{"state":Config.init_dew_heater_power> 0,"value":Config.init_dew_heater_power}}})
+            is_dew_on = Config.init_dew_heater_power > 0
+            self.send_message_param_sync({"method": "pi_output_set2", "params":{"heater":{"state":is_dew_on, "value":Config.init_dew_heater_power}}})
 
             # save frames setting
             self.send_message_param_sync({"method":"set_stack_setting", "params":{"save_discrete_ok_frame":Config.init_save_good_frames, "save_discrete_frame":Config.init_save_all_frames}})
+
+            response = self.send_message_param_sync({"method":"get_device_state"})
+            # make sure we have the right firmware version here
+            self.firmware_ver_int = response["result"]["device"]["firmware_ver_int"]
+            self.logger.info(f"Firmware version: {self.firmware_ver_int}")
 
             result = True
 
@@ -1016,7 +1288,8 @@ class Seestar:
                     msg = "Failed to park scope. Need to restart Seestar and try again."
                     self.logger.error(msg)
                     self.schedule['state'] == "stopping"
-                    return msg
+                    self.event_state["scheduler"]["cur_scheduler_item"]["action"]=msg
+                    return
 
                 result = self.wait_end_op("ScopeHome")
 
@@ -1036,8 +1309,16 @@ class Seestar:
                 lat = Config.scope_aim_lat
                 lon = Config.scope_aim_lon
 
-                lat = device.get('scope_aim_lat', lat)
-                lon = device.get('scope_aim_lon', lon)
+                if 'scope_aim_lat' in params:
+                    lat = params['scope_aim_lat']
+                else:
+                    lat = device.get('scope_aim_lat', lat)
+
+                if 'scope_aim_lon' in params:
+                    lon = params['scope_aim_lon']
+                else:
+                    lon = device.get('scope_aim_lon', lon)
+
                 self.below_horizon_dec_offset = 0
 
                 if lon < 0:
@@ -1048,6 +1329,12 @@ class Seestar:
                     lat = 80
 
                 cur_latlon = self.send_message_param_sync({"method":"scope_get_horiz_coord"})["result"]
+                if isinstance(cur_latlon, str):
+                    msg = f"Failed to get aiming position: {cur_latlon}"
+                    self.logger.error(msg)
+                    self.schedule['state'] == "stopping"
+                    self.event_state["scheduler"]["cur_scheduler_item"]["action"]=msg
+                    return
 
                 msg = f"moving scope's aim toward a clear patch of sky for HC, from lat-lon {cur_latlon[0]}, {cur_latlon[1]} to {lat}, {lon}"
                 self.logger.info(msg)
@@ -1064,7 +1351,9 @@ class Seestar:
                     if self.move_scope(direction, 1000, 10) == False:
                         break
                     time.sleep(0.1)
-                    cur_latlon = self.send_message_param_sync({"method":"scope_get_horiz_coord"})["result"]
+                    tmp = self.send_message_param_sync({"method":"scope_get_horiz_coord"})
+                    if 'result' in tmp:
+                        cur_latlon = tmp["result"]
                 self.move_scope(0, 0, 0)
 
                 while True:
@@ -1087,32 +1376,26 @@ class Seestar:
                 if self.schedule["state"] != "working":
                     return
 
+
             if do_AF:
+                # need to make sure we are in star mode
+                if "View" not in self.event_state or "mode" not in self.event_state["View"] or self.event_state["View"]["mode"] != "star":
+                    result = self.send_message_param_sync({"method": "iscope_start_view", "params": {"mode": "star"}})
+                    self.logger.info(f"start star mode: {result}")
+                    time.sleep(2)
                 msg = f"auto focus"
                 self.logger.info(msg)
                 self.event_state["scheduler"]["cur_scheduler_item"]["action"]=msg
                 result = self.try_auto_focus(2)
                 if result == False:
-                    self.logger.warn("Start-up sequence stopped and was unsuccessful.")
-                    self.schedule['state'] == "stopping"
+                    msg = "Auto focus was unsuccessful."
+                    self.logger.warn(msg)
+                    self.schedule['state'] = "stopping"
+                    self.event_state["scheduler"]["cur_scheduler_item"]["action"]=msg
                     return
 
             if self.schedule["state"] != "working":
                 return
-
-            if do_3PPA:
-                msg = f"3 point polar alignment"
-                self.logger.info(msg)
-                self.event_state["scheduler"]["cur_scheduler_item"]["action"]=msg
-                result = self.try_3PPA(1)
-                if result == False:
-                    self.logger.warn("Start-up sequence stopped and was unsuccessful.")
-                    self.schedule['state'] == "stopping"
-                    return
-
-            if self.schedule["state"] != "working":
-                return
-
 
             if do_dark_frames:
                 msg = f"dark frame measurement"
@@ -1120,34 +1403,135 @@ class Seestar:
                 self.event_state["scheduler"]["cur_scheduler_item"]["action"]=msg
                 result = self.try_dark_frame()
                 if result == False:
-                    self.logger.warn("Start-up sequence stopped and was unsuccessful.")
-                    self.schedule['state'] == "stopping"
+                    msg = "Failed to take dark frame data."
+                    self.event_state["scheduler"]["cur_scheduler_item"]["action"]=msg
+                    self.logger.warn(msg)
+                    self.schedule['state'] = "stopping"
+                    return
+                else:
+                    time.sleep(1)
+
+            if do_3PPA:
+                # need to make sure we are in star mode
+                if "View" not in self.event_state or "mode" not in self.event_state["View"] or self.event_state["View"]["mode"] != "star":
+                    result = self.send_message_param_sync({"method": "iscope_start_view", "params": {"mode": "star"}})
+                    self.logger.info(f"start star mode: {result}")
+                    time.sleep(2)
+                result = self.send_message_param_sync({"method":"set_setting","params":{"auto_3ppa_calib":True}})
+                msg = f"3 point polar alignment"
+                self.logger.info(msg)
+                self.event_state["scheduler"]["cur_scheduler_item"]["action"]=msg
+                result = self.try_3PPA(1)
+                if result == False:
+                    msg = "3 point PA was unsuccessful."
+                    self.logger.warn(msg)
+                    self.event_state["scheduler"]["cur_scheduler_item"]["action"]=msg
+                    self.schedule['state'] = "stopping"
                     return
 
             if self.schedule["state"] != "working":
                 return
 
+            if False:
+                time.sleep(1.0)
+                # move 15% back to the starting point, to be ready for anothr 3PPA after a BPA
+                response = self.send_message_param_sync({"method":"scope_move_left_by_angle", "params":[-15]})
+                result = self.wait_end_op("MoveByAngle")
+                self.logger.info(f"result to move back to starting point for 3PPA: {result}")
+
+                # ensure we are in star gazing mode again
+                tmp = self.send_message_param_sync({"method": "iscope_start_view", "params": {"mode": "star"}})
+                time.sleep(1)
+
+                response = self.send_message_param_sync({"method":"start_solve"})
+                result = self.wait_end_op("PlateSolve")
+                if result == True:
+                    self.logger.info(f"starting point platesolved to {self.cur_solve_RA}, {self.cur_solve_Dec}")
+                else:
+                    self.logger.warn("Failed to plate solve after moving back to starting point in 3PPA")
+
             if do_3PPA:
-                msg = "perform a quick goto routine to confirm and add to the sky model"
+                msg = "perform a quick goto routine to go back to start of 3ppa to confirm and add to the sky model"
+                self.event_state["scheduler"]["cur_scheduler_item"]["action"]=msg
                 self.logger.info(msg)
+                time.sleep(1.0)
                 response = self.send_message_param_sync({"method":"get_last_solve_result"})
                 last_pos = response["result"]["ra_dec"]
-                self.logger.info(f"move from {last_pos[0]}, {last_pos[1]}")
+
+                # sync to this position
+                # {"method":"scope_sync","params":[2.96,67.4]}
+                result = self._sync_target(last_pos)
+                self.logger.info(f"result from sync request: {result}")
+
+                # move a little bit, platesolve and sync to ensure we have a good sky model
+                time.sleep(1.0)
+                msg = "move a little bit, platesolve and sync to ensure we have a good sky model"
                 self.event_state["scheduler"]["cur_scheduler_item"]["action"]=msg
-                goto_params = {'is_j2000':False, 'ra': last_pos[0]+0.1, 'dec': last_pos[1]}
+                self.logger.info(msg)
+                response = self.send_message_param_sync({"method":"scope_move_left_by_angle", "params":[-1]})
+                result = self.wait_end_op("MoveByAngle")
+                time.sleep(2.0)
+                response = self.send_message_param_sync({"method":"iscope_start_view", "params":{"mode":"star"}})
+                self.logger.info(f"result from start star view: {response}")
+                time.sleep(2.0)
+                #platesolve
+                response = self.send_message_param_sync({"method":"start_solve"})
+                result = self.wait_end_op("PlateSolve")
+                if result == True:
+                    self.logger.info(f"platesolved to {self.cur_solve_RA}, {self.cur_solve_Dec}")
+                    self._sync_target([self.cur_solve_RA, self.cur_solve_Dec])
+                else:
+                    # try one more time...
+                    response = self.send_message_param_sync({"method":"start_solve"})
+                    result = self.wait_end_op("PlateSolve")
+                    if result == True:
+                        self.logger.info(f"platesolved to {self.cur_solve_RA}, {self.cur_solve_Dec}")
+                        self._sync_target([self.cur_solve_RA, self.cur_solve_Dec])
+                    else:
+                        msg = "Failed to plate solve after moving slightly to the left"
+                        self.logger.warn(msg)
+                        self.event_state["scheduler"]["cur_scheduler_item"]["action"]=msg
+                        self.schedule['state'] = "stopping"
+                        return
+
+                if self.schedule["state"] != "working":
+                    return
+
+                # now move back to position at start of 3ppa
+                time.sleep(1.0)
+                msg = "move back to position at start of 3ppa"
+                self.event_state["scheduler"]["cur_scheduler_item"]["action"]=msg
+                self.logger.info(msg)
+                goto_params = {'is_j2000':False, 'ra': self.first_plate_solve_RA, 'dec': self.first_plate_solve_Dec}
                 result = self.goto_target(goto_params)
-                self.logger.info(f"result from goto request: {result}")
-                result = self.wait_end_op("goto_target")
-                self.logger.info(f"Goto operation finished with result code: {result}")
+                msg = f"Goto operation finished with result code: {result}"
+                self.logger.info(msg)
+                self.event_state["scheduler"]["cur_scheduler_item"]["action"]=msg
+
+                if result == False:
+                    msg = "Failed to move back to starting point of 3PPA"
+                    self.logger.warn(msg)
+                    self.schedule['state'] = "stopping"
+                    self.event_state["scheduler"]["cur_scheduler_item"]["action"]=msg
+                    return
+
+                if self.schedule["state"] != "working":
+                    return
+
+                # i have seen instance where seestar automatically starts stacking, even though my param stack_after_goto is false
+                # so I will explicit tell seestar to stop stack just in case
+                time.sleep(2)
+                ignore = self.send_message_param_sync({"method":"iscope_stop_view","params":{"stage":"Stack"}})
+                time.sleep(1)
 
             self.logger.info(f"Start-up sequence result: {result}")
+            self.event_state["scheduler"]["cur_scheduler_item"]["action"]="complete"
 
-            if result:
-                self.event_state["scheduler"]["cur_scheduler_item"]["action"]="complete"
-            else:
-                self.schedule['state'] == "stopping"
-                self.event_state["scheduler"]["cur_scheduler_item"]["action"]="stopping"
         finally:
+            time.sleep(1)
+            if "View" not in self.event_state or "mode" not in self.event_state["View"] or self.event_state["View"]["mode"] != "star":
+                self.send_message_param_sync({"method": "iscope_start_view", "params": {"mode": "star"}})
+                time.sleep(2)
             if self.schedule['state'] == "stopping":
                 self.schedule['state'] = "stopped"
                 self.play_sound(82)
@@ -1156,11 +1540,26 @@ class Seestar:
                 self.play_sound(82)
 
     def action_set_dew_heater(self, params):
-        return self.send_message_param_sync({"method": "pi_output_set2", "params":{"heater":{"state":params['heater']> 0,"value":params['heater']}}})
+        response = self.send_message_param_sync({"method": "pi_output_set2", "params":{"heater":{"state":params['heater']> 0,"value":params['heater']}}})
+        return response
+
+    def action_set_exposure(self, params):
+        set_response = self.send_message_param_sync({"method": "set_setting", "params":{"exp_ms":{"stack_l":params['exp']}}})
+        dark_response = self.send_message_param_sync({"method": "start_create_dark"})
+        response = {
+            "set_response": set_response,
+            "dark_response": dark_response,
+        }
+        return response
 
     def action_start_up_sequence(self, params):
         if self.schedule['state'] != "stopped" and self.schedule['state'] != "complete" :
             return self.json_result("start_up_sequence", -1, "Device is busy. Try later.")
+        response = self.send_message_param_sync({"method":"set_setting","params":{"master_cli":True}})
+        self.logger.info(f"set master_cli response: {response}")
+        if not self.is_client_master():
+            self.json_result("start_up_sequence", -1, "Alp is not the device controller. Will try to grab control first.")
+            return self.json_result("Need to be master client to start up sequence.", -1, "Need to be master client to start up sequence.")
 
         move_up_dec_thread = threading.Thread(name=f"start-up-thread:{self.device_name}", target=lambda: self.start_up_thread_fn(params, False))
         move_up_dec_thread.start()
@@ -1189,21 +1588,21 @@ class Seestar:
             center_Dec = params["dec"]
             is_j2000 = params['is_j2000']
             target_name = params["target_name"]
-            session_length = params["session_time_sec"]
+            exposure_time_per_segment = params["panel_time_sec"]
             stack_params = {"gain": params["gain"], "restart": True}
             spacing = [5.3, 6.2, 6.5, 7.1, 8.0, 8.9, 9.2, 9.8]
             is_LP = [False, False, True, False, False, False, True, False]
             num_segments = len(spacing)
 
-            item_state = {"type": "spectra", "schedule_item_id": self.schedule['current_item_id'], "target_name":target_name, "action": "slew to target", "item_total_time_s":session_length, "item_remaining_time_s":session_length}
-            self.update_scheduler_state_obj(item_state)
             parsed_coord = Util.parse_coordinate(is_j2000, center_RA, center_Dec)
             center_RA = parsed_coord.ra.hour
             center_Dec = parsed_coord.dec.deg
 
             # 60s for the star
-            exposure_time_per_segment = round((session_length - 60.0) / num_segments)
-            time_remaining = session_length
+            time_remaining = exposure_time_per_segment * num_segments - 60.0
+
+            item_state = {"type": "spectra", "schedule_item_id": self.schedule['current_item_id'], "target_name":target_name, "action": "slew to target", "item_total_time_s":exposure_time_per_segment, "item_remaining_time_s":time_remaining}
+            self.update_scheduler_state_obj(item_state)
 
             if center_RA < 0:
                 center_RA = self.ra
@@ -1244,7 +1643,7 @@ class Seestar:
                         self.stop_stack()
                         self.schedule['state'] = "stopped"
                         return
-                    time_remaining = session_length - 60 - index*exposure_time_per_segment + count_down
+                    time_remaining -= count_down
                     time.sleep(10)
                     count_down -= 10
                     time_remaining -= 10
@@ -1258,8 +1657,9 @@ class Seestar:
             self.is_cur_scheduler_item_working = False
 
 
-    # {"target_name":"kai_Vega", "ra":-1.0, "dec":-1.0, "is_use_lp_filter_too":true, "session_time_sec":600, "grating_lines":300}
+    # {"target_name":"kai_Vega", "ra":-1.0, "dec":-1.0, "is_use_lp_filter_too":true, "panel_time_sec":600, "grating_lines":300}
     def start_spectra_item(self, params):
+        self.is_cur_scheduler_item_working = False
         if self.schedule['state'] != "working":
             self.logger.info("Run Scheduler is stopping")
             self.schedule['state'] = "stopped"
@@ -1270,37 +1670,26 @@ class Seestar:
         return "spectra mosiac started"
 
     def mosaic_goto_inner_worker(self, cur_ra, cur_dec, save_target_name, is_use_autofocus, is_use_LP_filter):
-        self.goto_target({'ra': cur_ra, 'dec': cur_dec, 'is_j2000': False, 'target_name': save_target_name})
-        result = self.wait_end_op("goto_target")
+        result = self.goto_target({'ra': cur_ra, 'dec': cur_dec, 'is_j2000': False, 'target_name': save_target_name})
         self.logger.info(f"Goto operation finished with result code: {result}")
-
-        time.sleep(3)
-
-        if result == True:
-            self.send_message_param_sync(
-                {"method": "set_setting", "params": {"stack_lenhance": is_use_LP_filter}})
-            if is_use_autofocus == True:
-                self.event_state["scheduler"]["cur_scheduler_item"]["action"] = "auto focusing"
-                result = self.try_auto_focus(2)
-            if result == False:
-                self.logger.info("Failed to auto focus, but will continue to next panel anyway.")
-                result = True
-            if result == True:
-                # need to check if we have a custom goto running, and make sure it is finished before stacking
-                while self.custom_goto_state == "start" or self.custom_goto_state == "working":
-                    if self.custom_goto_state == "fail":
-                        self.logger.warn("Failed to goto the target with custom goto logic before stacking. Will stop here.")
-                        return False
-                    time.sleep(3)
-                self.custom_goto_state = "stopped"
-                time.sleep(4)
-                return True
-        else:
+        if result == False:
             self.logger.info("Goto failed.")
             return False
 
+        time.sleep(3)
 
-    def mosaic_thread_fn(self, target_name, center_RA, center_Dec, is_use_LP_filter, session_time, nRA, nDec,
+
+        self.send_message_param_sync(
+            {"method": "set_setting", "params": {"stack_lenhance": is_use_LP_filter}})
+        if is_use_autofocus == True:
+            self.event_state["scheduler"]["cur_scheduler_item"]["action"] = "auto focusing"
+            result = self.try_auto_focus(2)
+        if result == False:
+            self.logger.info("Failed to auto focus, but will continue to image panel anyway.")
+            result = True
+        return result
+
+    def mosaic_thread_fn(self, target_name, center_RA, center_Dec, is_use_LP_filter, panel_time_sec, nRA, nDec,
                          overlap_percent, gain, is_use_autofocus, selected_panels, num_tries, retry_wait_s):
         try:
             spacing_result = Util.mosaic_next_center_spacing(center_RA, center_Dec, overlap_percent)
@@ -1321,7 +1710,7 @@ class Seestar:
             if nDec % 2 == 0:
                 center_Dec += delta_Dec / 2
 
-            sleep_time_per_panel = round(session_time / nRA / nDec)
+            sleep_time_per_panel = round(panel_time_sec)
 
             item_remaining_time_s = sleep_time_per_panel * num_panels
             item_state = {"type": "mosaic", "schedule_item_id": self.schedule['current_item_id'], "target_name":target_name, "action": "start", "item_total_time_s":item_remaining_time_s, "item_remaining_time_s":item_remaining_time_s}
@@ -1387,20 +1776,29 @@ class Seestar:
                         msg = f"Failed to goto target after {num_tries} tries."
                         self.logger.warn(msg)
                         self.event_state["scheduler"]["cur_scheduler_item"]["action"] = msg
-                        return
+
+                        cur_ra += delta_RA
+                        continue
 
                     msg = f"stacking the panel for {sleep_time_per_panel} seconds"
                     self.logger.info(msg)
                     self.event_state["scheduler"]["cur_scheduler_item"]["action"] = msg
 
+                    # be sure we are using the right target name before we stack
+                    self.set_target_name(save_target_name)
+
                     if not self.start_stack({"gain": gain, "restart": True}):
                         msg = "Failed to start stacking."
                         self.logger.warn(msg)
                         self.event_state["scheduler"]["cur_scheduler_item"]["action"] = msg
-                        return
+
+                        cur_ra += delta_RA
+                        continue
 
                     panel_remaining_time_s = sleep_time_per_panel
                     for i in range(round(sleep_time_per_panel/5)):
+                        self.event_state["scheduler"]["cur_scheduler_item"]["panel_remaining_time_s"] = panel_remaining_time_s
+                        self.event_state["scheduler"]["cur_scheduler_item"]["item_remaining_time_s"] = item_remaining_time_s
                         threading.current_thread().last_run = datetime.now()
 
                         if self.schedule['state'] != "working":
@@ -1408,13 +1806,14 @@ class Seestar:
                             self.event_state["scheduler"]["cur_scheduler_item"]["action"] = "Scheduler was requested to stop. Stopping at current mosaic."
                             self.stop_stack()
                             self.schedule['state'] = "stopped"
+                            self.event_state["scheduler"]["cur_scheduler_item"]["panel_remaining_time_s"] = 0
+                            self.event_state["scheduler"]["cur_scheduler_item"]["item_remaining_time_s"] = 0
                             return
 
                         time.sleep(5)
                         panel_remaining_time_s -= 5
                         item_remaining_time_s -= 5
-                        self.event_state["scheduler"]["cur_scheduler_item"]["panel_remaining_time_s"] = panel_remaining_time_s
-                        self.event_state["scheduler"]["cur_scheduler_item"]["item_remaining_time_s"] = item_remaining_time_s
+                    self.event_state["scheduler"]["cur_scheduler_item"]["panel_remaining_time_s"] = 0
                     self.stop_stack()
                     msg = "Stacking operation finished " + save_target_name
                     self.logger.info(msg)
@@ -1428,16 +1827,23 @@ class Seestar:
             self.is_cur_scheduler_item_working = False
 
     def start_mosaic_item(self, params):
+        self.is_cur_scheduler_item_working = False
+
         if self.schedule['state'] != "working":
             self.logger.info("Run Scheduler is stopping")
             self.schedule['state'] = "stopped"
             return
+
         target_name = params['target_name']
         center_RA = params['ra']
         center_Dec = params['dec']
         is_j2000 = params['is_j2000']
         is_use_LP_filter = params['is_use_lp_filter']
-        session_time = params['session_time_sec']
+        if 'panel_time_sec' not in params:
+            self.logger.error("Mosaic schedule spec has changed. Use panel_time_sec instad of session_time_sec to specify length of capture.")
+            panel_time_sec = params['session_time_sec']
+        else:
+            panel_time_sec = params['panel_time_sec']
         nRA = params['ra_num']
         nDec = params['dec_num']
         overlap_percent = params['panel_overlap_percent']
@@ -1467,19 +1873,27 @@ class Seestar:
         center_RA = parsed_coord.ra.hour
         center_Dec = parsed_coord.dec.deg
 
+        response = self.send_message_param_sync({"method": "get_setting"})
+        result = response["result"]
+        self.logger.info(f"get_setting response: {result}")
+
         # print input requests
         self.logger.info("received parameters:")
+        self.logger.info(f"Firmware version: {self.firmware_ver_int}")
         self.logger.info("  target        : " + target_name)
         self.logger.info("  RA            : %s", center_RA)
         self.logger.info("  Dec           : %s", center_Dec)
         self.logger.info("  from RA       : %s", self.ra)
         self.logger.info("  from Dec      : %s", self.dec)
         self.logger.info("  use LP filter : %s", is_use_LP_filter)
-        self.logger.info("  session time  : %s", session_time)
+        self.logger.info("  panel time (s): %s", panel_time_sec)
         self.logger.info("  RA num panels : %s", nRA)
         self.logger.info("  Dec num panels: %s", nDec)
         self.logger.info("  overlap %%    : %s", overlap_percent)
         self.logger.info("  gain          : %s", gain)
+        self.logger.info("  exposure time : %s", result["exp_ms"]["stack_l"])
+        self.logger.info("  dither pixLen : %s", result["stack_dither"]["pix"])
+        self.logger.info("  dither interv : %s", result["stack_dither"]["interval"])
         self.logger.info("  use autofocus : %s", is_use_autofocus)
         self.logger.info("  select panels : %s", selected_panels)
         self.logger.info("  # goto tries  : %s", num_tries)
@@ -1487,10 +1901,11 @@ class Seestar:
 
         self.is_cur_scheduler_item_working = True
         self.mosaic_thread = threading.Thread(
-            target=lambda: self.mosaic_thread_fn(target_name, center_RA, center_Dec, is_use_LP_filter, session_time,
+            target=lambda: self.mosaic_thread_fn(target_name, center_RA, center_Dec, is_use_LP_filter, panel_time_sec,
                                                  nRA, nDec, overlap_percent, gain, is_use_autofocus, selected_panels, num_tries, retry_wait_s))
         self.mosaic_thread.name = f"MosaicThread:{self.device_name}"
         self.mosaic_thread.start()
+        return
 
     def get_schedule(self, params):
         if 'schedule_id' in params:
@@ -1511,13 +1926,14 @@ class Seestar:
             schedule_id = str(uuid.uuid4())
 
         self.schedule['schedule_id'] = schedule_id
-        self.schedule['state'] = self.schedule['state']
+        self.schedule['state'] = "stopped"
         self.schedule['list'].clear()
         return self.schedule
 
     def construct_schedule_item(self, params):
-        if params['action'] == 'start_mosaic':
-            mosaic_params = params['params']
+        item = params.copy()
+        if item['action'] == 'start_mosaic':
+            mosaic_params = item['params']
             if isinstance(mosaic_params['ra'], str):
                 # try to trim the seconds to 1 decimal
                 mosaic_params['ra'] = Util.trim_seconds(mosaic_params['ra'])
@@ -1529,8 +1945,8 @@ class Seestar:
                     mosaic_params['is_j2000'] = False
                 mosaic_params['ra'] = round(mosaic_params['ra'], 4)
                 mosaic_params['dec'] = round(mosaic_params['dec'], 4)
-        params['schedule_item_id'] = str(uuid.uuid4())
-        return params
+        item['schedule_item_id'] = str(uuid.uuid4())
+        return item
 
     def add_schedule_item(self, params):
         new_item = self.construct_schedule_item(params)
@@ -1611,8 +2027,8 @@ class Seestar:
     def export_schedule(self, params):
         filepath = params["filepath"]
         with open(filepath, 'w') as fp:
-            json.dump(self.schedule, fp, indent=4)
-        return 0
+            json.dump(self.schedule, fp, indent=4, cls=DequeEncoder)
+        return self.schedule
 
     def import_schedule(self, params):
         if self.schedule['state'] != "stopped" and self.schedule['state'] != "complete":
@@ -1621,13 +2037,14 @@ class Seestar:
         is_retain_state = params["is_retain_state"]
         with open(filepath, 'r') as f:
             self.schedule = json.load(f)
+        self.schedule['list'] = collections.deque(self.schedule['list'])
 
         if not is_retain_state:
             self.schedule['schedule_id'] = str(uuid.uuid4())
             for item in self.schedule['list']:
-                item['id'] = str(uuid.uuid4())
+                item['schedule_item_id'] = str(uuid.uuid4())
             self.schedule['state'] = "stopped"
-        return 0
+        return self.schedule
 
     # shortcut to start a new scheduler with only a mosaic request
     def start_mosaic(self, params):
@@ -1662,12 +2079,15 @@ class Seestar:
     def start_scheduler(self, params):
         if "schedule_id" in params and params['schedule_id'] != self.schedule['schedule_id']:
             return self.json_result("start_scheduler", 0, f"Schedule with id {params['schedule_id']} did not match this device's schedule. Returned with no action.")
+        if not self.is_client_master():
+            return self.json_result("start_scheduler", -1, "This device cannot be controlled. Grab the control first.")
         if self.schedule['state'] != "stopped" and self.schedule['state'] != "complete":
             return self.json_result("start_scheduler", -1, "An existing scheduler is active. Returned with no action.")
+
         self.scheduler_thread = threading.Thread(target=lambda: self.scheduler_thread_fn(), daemon=True)
         self.scheduler_thread.name = f"SchedulerThread:{self.device_name}"
         self.scheduler_thread.start()
-        self.schedule['state'] = "working"
+
         return self.schedule
 
     # scheduler state example: {"state":"working", "schedule_id":"abcdefg",
@@ -1752,6 +2172,12 @@ class Seestar:
                 while startup_thread.is_alive():
                     update_time()
                     time.sleep(2)
+            elif action == 'action_set_dew_heater':
+                self.logger.info(f"Trying to set dew heater to {cur_schedule_item['params']}")
+                self.action_set_dew_heater(cur_schedule_item['params'])
+            elif action == 'action_set_exposure':
+                self.logger.info(f"Trying to set exposure to {cur_schedule_item['params']}")
+                self.action_set_exposure(cur_schedule_item['params'])
             else:
                 if 'params' in cur_schedule_item:
                     request = {'method': action, 'params': cur_schedule_item['params']}
@@ -1779,6 +2205,7 @@ class Seestar:
             self.stop_slew()
             self.stop_stack()
             self.play_sound(83)
+            self.schedule['state'] = "stopped"
             return self.json_result("stop_scheduler", 0, f"Scheduler stopped successfully.")
 
         elif self.schedule['state'] == "complete":
@@ -1789,17 +2216,20 @@ class Seestar:
             return self.json_result("stop_scheduler", -5, f"scheduler is in unaccounted for state: {self.schedule['state']}")
 
     def wait_end_op(self, in_op_name):
+        self.logger.info(f"Waiting for {in_op_name} to finish.")
         if in_op_name == "goto_target":
             self.mark_goto_status_as_start()
             while self.is_goto() == True:
                 time.sleep(1)
-            return self.is_goto_completed_ok()
-
+            result = self.is_goto_completed_ok()
         else:
             self.event_state[in_op_name] = {"state":"stopped"}
             while in_op_name not in self.event_state or (self.event_state[in_op_name]["state"] != "complete" and self.event_state[in_op_name]["state"] != "fail"):
                 time.sleep(1)
-            return self.event_state[in_op_name]["state"] == "complete"
+                result = self.event_state[in_op_name]["state"] == "complete"
+
+        self.logger.info(f"Finished waiting for {in_op_name}. Result: {result}")
+        return result
 
     # def sleep_with_heartbeat(self, in_sleep_time):
     #     stacking_timer = 0
@@ -1842,6 +2272,27 @@ class Seestar:
                 host="SSC"
             self.send_message_param_sync({"method":"set_setting", "params":{"cli_name": f"{host}"}})
 
+    def event_callbacks_init(self, initial_state):
+        self.logger.info(f'event_callback_init({self}, {initial_state})')
+        self.event_callbacks = [
+            BatteryWatch(self, initial_state),
+            #SensorTempWatch(self, initial_state)
+        ]
+
+        # read files in user_triggers subdir, and read json
+        user_hooks = []
+        for filename in os.listdir("user_hooks"):
+            if filename.endswith(".json"):
+                filepath = os.path.join("user_hooks", filename)
+                with open(filepath, 'r') as f:
+                    try:
+                        user_hooks.append(json.load(f))
+                    except json.JSONDecodeError as e:
+                        self.logger.warn("Unable to decode user_hooks/{filename} - json parsing error")
+        for hook in user_hooks:
+            if "events" in hook and "execute" in hook:
+                self.event_callbacks.append(UserScriptEvent(self, initial_state, hook))
+
     def start_watch_thread(self):
         # only bail if is_watch_events is true
         if self.is_watch_events:
@@ -1871,13 +2322,13 @@ class Seestar:
                 self.heartbeat_msg_thread.name = f"HeartbeatMsgThread:{self.device_name}"
                 self.heartbeat_msg_thread.start()
 
-                response = self.send_message_param_sync({ "method": "get_device_state",  "params": {"keys":["device"]}})
-                self.firmware_ver_int = response["result"]["device"]["firmware_ver_int"]
-
+                initial_state = self.send_message_param_sync({"method":"get_device_state"})
                 self.guest_mode_init()
+                self.event_callbacks_init(initial_state["result"])
 
             except Exception as ex:
                 # todo : Disconnect socket and set is_watch_events false
+                #print(f"XXXX Exception {ex}")
                 pass
 
     def end_watch_thread(self):
