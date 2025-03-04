@@ -31,6 +31,10 @@
                 {% if event_status and event_status.percent %}
                     <strong>% Complete:</strong> {{ event_status.percent }}<br>
                 {% endif %}
+				{% if event_status and event_status.eq_offset_alt and event_status.eq_offset_az %}
+					<strong>Alt Error:</strong> {{ event_status.eq_offset_alt | round(3) }}<br>
+					<strong>Az Error:</strong> {{ event_status.eq_offset_az | round(3) }}<br>
+				{% endif %}
             {% endif %}
 
             {% if event_name == 'AutoFocus' %}
@@ -67,6 +71,12 @@
                         {% set filter = "DARK" %}
                     {% endif %}
                     <strong>Filter:</strong> {{ filter }}<br>
+                {% endif %}
+            {% endif %}
+
+            {% if event_name == 'Scheduler' %}
+                {% if event_status and event_status.cur_scheduler_item %}
+                    <strong>Action:</strong> {{ event_status.cur_scheduler_item.type }}
                 {% endif %}
             {% endif %}
         </p>

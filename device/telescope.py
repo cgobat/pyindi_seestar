@@ -136,9 +136,22 @@ class action:
         else:
             cur_dev = seestar_dev[devnum]
 
-
         try:
+            result = ""
+
             params = json.loads(parameters)
+            log_debug = False
+            if action_name == "method_sync" and params["method"] in ["scope_get_equ_coord", "get_view_state"]:
+                cur_dev.logger.debug(f"request: {action_name} for device {devnum} with param {parameters}")
+                log_debug = True
+            elif action_name in ["get_event_state", "get_view_state"]:
+                cur_dev.logger.debug(f"request: {action_name} for device {devnum} with param {parameters}")
+                log_debug = True
+            else:
+                cur_dev.logger.info(f"request: {action_name} for device {devnum} with param {parameters}")
+
+
+
             # print(f'Received request: Action {action_name} with params {params}')
             if action_name == "get_event_state":
                 result = cur_dev.get_event_state(params)
@@ -148,7 +161,7 @@ class action:
                 resp.text = MethodResponse(req, value = result).json
             elif action_name == "method_sync":
                 result = cur_dev.send_message_param_sync(params)
-                if params["method"] == 'pi_shutdown': 
+                if params["method"] == 'pi_shutdown':
                     print('Seestar has been shut down')
                     # we will leave the threads running in case user leaves app running
                     # end_seestar_device(devnum)
@@ -173,6 +186,9 @@ class action:
                 resp.text = MethodResponse(req, value = result).json
             elif action_name == "is_goto_completed_ok":
                 result = cur_dev.is_goto_completed_ok()
+                resp.text = MethodResponse(req, value = result).json
+            elif action_name == "adjust_focus":
+                result = cur_dev.adjust_focus(params["steps"])
                 resp.text = MethodResponse(req, value = result).json
             elif action_name == "start_spectra":
                 result = cur_dev.start_spectra(params)
@@ -213,15 +229,47 @@ class action:
             elif action_name == "action_set_dew_heater":
                 result = cur_dev.action_set_dew_heater(params)
                 resp.text = MethodResponse(req, value = result).json
+            elif action_name == "action_set_exposure":
+                result = cur_dev.action_set_exposure(params)
+                resp.text = MethodResponse(req, value = result).json
             elif action_name == "get_last_image":
                 redirect_url = cur_dev.get_last_image(params)
-                resp.text = MethodResponse(req, value = redirect_url).json  
+                resp.text = MethodResponse(req, value = redirect_url).json
             elif action_name == "adjust_mag_declination":
-                result = cur_dev.adjust_mag_declination(params) 
+                result = cur_dev.adjust_mag_declination(params)
                 resp.text = MethodResponse(req, value = result).json
+            elif action_name == "start_plate_solve_loop":
+                result = cur_dev.start_plate_solve_loop()
+                resp.text = MethodResponse(req, value = result).json
+            elif action_name == "stop_plate_solve_loop":
+                result = cur_dev.stop_plate_solve_loop()
+                resp.text = MethodResponse(req, value = result).json
+            elif action_name == "get_pa_error":
+                result = cur_dev.get_pa_error(params)
+                resp.text = MethodResponse(req, value = result).json
+            elif action_name == "pause_scheduler":
+                result = cur_dev.pause_scheduler(params)
+                resp.text = MethodResponse(req, value = result).json
+            elif action_name == "continue_scheduler":
+                result = cur_dev.continue_scheduler(params)
+                resp.text = MethodResponse(req, value = result).json
+            elif action_name == "skip_scheduler_cur_item":
+                result = cur_dev.skip_scheduler_cur_item(params)
+                resp.text = MethodResponse(req, value = result).json
+            if log_debug:
+                cur_dev.logger.debug(f"response: {result}")
+            else:
+                cur_dev.logger.info(f"response: {result}")
+
+            if hasattr(cur_dev, 'event_callbacks'):
+                event_name = f"action_{action_name}"
+                for cb in cur_dev.event_callbacks:
+                    if event_name in cb.fireOnEvents() or "action_*" in cb.fireOnEvents():
+                        cb.eventFired(cur_dev, { "Event": event_name, **params })
         except Exception as ex:
             resp.text = MethodResponse(req,
                             DevDriverException(0x500, '\n'.join(ex.args), ex)).json
+            cur_dev.logger.warn("Error making request: {ex}")
 
 
 @before(PreProcessRequest(maxdev))
