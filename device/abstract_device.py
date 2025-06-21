@@ -1,14 +1,45 @@
+import collections
 from abc import ABC, abstractmethod
-from typing import Any, TypedDict
+from typing import Any, TypedDict, NotRequired, Literal
 
 
 class StartStackParams(TypedDict):
     """Start stack parameters"""
+
     gain: int
     restart: bool
 
 
+class MessageParams(TypedDict):
+    """Message parameter"""
+
+    id: NotRequired[int]
+    method: str
+    params: NotRequired[dict[str, Any] | list[Any]]
+    result: NotRequired[str]
+
+
+type ScheduleState = Literal["working", "stopped", "stopping", "paused", "complete"]
+
+
+class Schedule(TypedDict):
+    version: float
+    Event: str
+    schedule_id: str
+    list: collections.deque
+    state: str
+    is_stacking_paused: bool
+    is_stacking: bool
+    is_skip_requested: bool
+    current_item_id: str
+    item_number: int
+
+
 class AbstractDevice(ABC):
+    @abstractmethod
+    def get_name(self) -> str:
+        pass
+
     @abstractmethod
     def disconnect(self):
         pass
@@ -39,6 +70,10 @@ class AbstractDevice(ABC):
 
     @abstractmethod
     def is_goto_completed_ok(self):
+        pass
+
+    @abstractmethod
+    def start_spectra(self, params):
         pass
 
     @abstractmethod
@@ -74,6 +109,10 @@ class AbstractDevice(ABC):
         pass
 
     @abstractmethod
+    def action_set_exposure(self, params):
+        pass
+
+    @abstractmethod
     def action_start_up_sequence(self, params):
         pass
 
@@ -90,8 +129,20 @@ class AbstractDevice(ABC):
         pass
 
     @abstractmethod
-    def get_section_array_for_mosaic(self, device_id_list, params):
+    def insert_schedule_item_before(self, params):
         pass
+
+    @abstractmethod
+    def replace_schedule_item(self, params):
+        pass
+
+    @abstractmethod
+    def remove_schedule_item(self, params):
+        pass
+
+    # @abstractmethod
+    # def get_section_array_for_mosaic(self, device_id_list, params):
+    #     pass
 
     @abstractmethod
     def start_mosaic(self, cur_params):
@@ -106,62 +157,34 @@ class AbstractDevice(ABC):
         pass
 
     # new types
+    @property
+    @abstractmethod
     def is_connected(self) -> bool:
         pass
 
-    def send_message_param(self, params):
-        pass
-
-    def start_spectra(self, params):
-        pass
-
-    def insert_schedule_item_before(self, params):
-        pass
-
-    def replace_schedule_item(self, params):
-        pass
-
-    def remove_schedule_item(self, params):
-        pass
-
-    def get_last_image(self, params):
-        pass
-
-    def adjust_mag_declination(self, params):
-        pass
-
-    def start_watch_thread(self):
-        pass
-
-    def end_watch_thread(self):
-        pass
-
-    def site_elevation(self):
-        pass
-
-    def site_latitude(self):
-        pass
-
-    def site_longitude(self):
-        pass
-
-    def is_slewing(self):
-        pass
-
-    def dec(self):
-        pass
-
+    @property
+    @abstractmethod
     def ra(self):
         pass
 
-    def target_dec(self) -> float:
+    @property
+    @abstractmethod
+    def dec(self):
         pass
 
-    def target_ra(self) -> float:
+    @abstractmethod
+    def send_message_param(self, params):
         pass
 
-    def utcdate(self):
+    @abstractmethod
+    def start_watch_thread(self):
         pass
 
-    def sync_target_dec(self, params):
+    @abstractmethod
+    def end_watch_thread(self):
+        pass
+
+    @abstractmethod
+    def get_events(self):
+        # this is only used in some places...
         pass

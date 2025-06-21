@@ -27,6 +27,7 @@ can_reverse = true
 step_size = 1.0
 steps_per_sec = 6
 
+
 [seestar_initialization]
 save_good_frames = true
 save_all_frames = false             # including good and bad frames
@@ -38,12 +39,14 @@ exposure_length_stack_ms = 10000
 dither_enabled = true
 dither_length_pixel = 50
 dither_frequency = 10
-activate_LP_filter = false                   
+activate_LP_filter = false
 dew_heater_power = 0                # 0 - 100; 0 is off, 100 is max
-scope_aim_lat = 60          # start up latitude in degrees -90 to 80
-scope_aim_lon = 20          # start up longitude in degrees 0 to 360
-is_EQ_mode = false
+move_arm_lat_sec = 2           # start up raise arm setting for moving up/down from zenith in movement clock seconds, from -20 to 20
+move_arm_lon_sec = 20          # start up raise arm setting for moving counter/clockwise from zenith in movement clock seconds, from -100 to 100
+is_EQ_mode = true           # set to false if you want the old standard alt-az mode
 guest_mode_init = true
+battery_low_limit = 3
+is_frame_calibrated = true
 
 [logging]
 log_level = 'INFO'   #'WARN' only if trouble    #'INFO' to output more logging      #'DEBUG' still more output
@@ -59,8 +62,8 @@ name = "Seestar Alpha"
 ip_address = "seestar.local"
 device_num = 1
 # You can specify the following settings to override those found in the seestar_initialization section on a per-device level
-#scope_aim_lat = 60          # start up latitude in degrees -90 to 80 (override default)
-#scope_aim_lon = 20          # start up longitude in degrees 0 to 360 (override default)
+#move_arm_lat_sec = 2           # start up raise arm setting for moving up/down from zenith in movement clock seconds, from -20 to 20
+#move_arm_lon_sec = 20          # start up raise arm setting for moving counter/clockwise from zenith in movement clock seconds, from -100 to 100
 #is_EQ_mode = false          # can be used to override default
 
 #[[seestars]]
