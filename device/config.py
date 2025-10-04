@@ -74,11 +74,10 @@ class _Config:
         self.load_toml(self.path_to_dat)
 
     @staticmethod
-    def strToBool(inputString: str):
-        if inputString in ["True", "true", "on"] or inputString:
-            return True
-        else:
-            return False
+    def strToBool(s) -> bool:
+        if isinstance(s, bool):
+            return s
+        return str(s).strip().lower() in {"1", "true", "on", "yes", "y"}
 
     def get_toml(self, sect: str, item: str, default: typing.Any):
         """
@@ -127,6 +126,13 @@ class _Config:
         self.loading_gif: str = self.get_toml(
             "webui_settings", "loading_gif", "loading.gif"
         )
+        self.webui_text_color: str = self.get_toml("webui_settings", "text_color", "")
+        self.webui_font_family: str = self.get_toml("webui_settings", "font_family", "")
+        self.webui_font_url: str = self.get_toml("webui_settings", "font_url", "")
+        self.webui_link_color: str = self.get_toml("webui_settings", "link_color", "")
+        self.webui_accent_color: str = self.get_toml(
+            "webui_settings", "accent_color", ""
+        )
 
         # Fixup bad configs
         if f"{self.save_frames_dir}" == "True" or f"{self.save_frames_dir}" == "False":
@@ -155,8 +161,6 @@ class _Config:
                 {
                     "name": "Seestar Alpha",
                     "ip_address": "seestar.local",
-                    "move_arm_lat_sec": 2.0,
-                    "move_arm_lon_sec": 20.0,
                     "is_EQ_mode": False,
                     "device_num": 1,
                 }
@@ -217,10 +221,9 @@ class _Config:
         )
         self.init_dew_heater_power: int = self.get_toml(section, "dew_heater_power", 0)
         self.init_guest_mode: bool = self.get_toml(section, "guest_mode_init", True)
-        self.move_arm_lat_sec: float = self.get_toml(section, "move_arm_lat_sec", 2.0)
-        self.move_arm_lon_sec: float = self.get_toml(section, "move_arm_lon_sec", 20.0)
         self.is_EQ_mode: bool = self.get_toml(section, "is_EQ_mode", False)
         self.battery_low_limit: int = self.get_toml(section, "battery_low_limit", 3)
+        self.dec_pos_index: int = self.get_toml(section, "dec_pos_index", 3)
         self.is_frame_calibrated: bool = self.get_toml(
             section, "is_frame_calibrated", True
         )
@@ -229,7 +232,6 @@ class _Config:
         """
         Save the config html form into a toml file
         """
-
         req.get_media()
 
         # Reset arrays
@@ -242,30 +244,30 @@ class _Config:
         else:
             deviceCount = 1
 
-        # Iterate through the devices and add them to the lists
+        # Iterate through the devices and add them to the lists, skipping deleted ones
+        new_device_num = 1
         for devNum in range(deviceCount):
+            # Check if this device is marked for deletion
+            delete_key = f"delete_{devNum + 1}"
+            if delete_key in req.media and self.strToBool(req.media[delete_key]):
+                continue  # Skip this device
+
             if deviceCount > 1:
                 ss_name = req.media["ss_name"][devNum]
                 ss_ip = req.media["ss_ip_address"][devNum]
-                ss_lat = req.media["ss_move_arm_lat_sec"][devNum]
-                ss_lon = req.media["move_arm_lon_sec"][devNum]
-                ss_eq = self.strToBool(req.media["ss_is_EQ_mode"][devNum])
-                print(f"Device {devNum} EQ is : {ss_eq}")
+                key = f"ss_is_EQ_mode_{devNum + 1}"
+                ss_eq = key in req.media
             else:
                 ss_name = req.media["ss_name"]
                 ss_ip = req.media["ss_ip_address"]
-                ss_lat = req.media["ss_move_arm_lat_sec"]
-                ss_lon = req.media["ss_move_arm_lon_sec"]
-                ss_eq = self.strToBool(req.media["ss_is_EQ_mode"])
+                ss_eq = "ss_is_EQ_mode_1" in req.media
 
-            # Add to local config
+            # Add to local config with new sequential device number
             self.seestars.append(
                 {
                     "name": ss_name,
                     "ip_address": ss_ip,
-                    "device_num": devNum + 1,
-                    "move_arm_lat_sec": float(ss_lat),
-                    "move_arm_lon_sec": float(ss_lon),
+                    "device_num": new_device_num,
                     "is_EQ_mode": ss_eq,
                 }
             )
@@ -274,12 +276,12 @@ class _Config:
                 {
                     "name": ss_name,
                     "ip_address": ss_ip,
-                    "device_num": devNum + 1,
-                    "move_arm_lat_sec": float(ss_lat),
-                    "move_arm_lon_sec": float(ss_lon),
+                    "device_num": new_device_num,
                     "is_EQ_mode": ss_eq,
                 }
             )
+
+            new_device_num += 1
 
         # network
         self.set_toml("network", "ip_address", req.media["ip_address"])
@@ -298,6 +300,11 @@ class _Config:
         self.set_toml("webui_settings", "save_frames", "save_frames" in req.media)
         self.set_toml("webui_settings", "save_frames_dir", req.media["save_frames_dir"])
         self.set_toml("webui_settings", "loading_gif", req.media["loading_gif"])
+        self.set_toml("webui_settings", "text_color", req.media["text_color"])
+        self.set_toml("webui_settings", "font_family", req.media["font_family"])
+        self.set_toml("webui_settings", "font_url", req.media["font_url"])
+        self.set_toml("webui_settings", "link_color", req.media["link_color"])
+        self.set_toml("webui_settings", "accent_color", req.media["accent_color"])
 
         # server
         self.set_toml("server", "location", req.media["location"])
@@ -371,19 +378,14 @@ class _Config:
             "dew_heater_power",
             int(req.media["init_dew_heater_power"]),
         )
-        self.set_toml(
-            "seestar_initialization",
-            "move_arm_lat_sec",
-            float(req.media["move_arm_lat_sec"]),
-        )
-        self.set_toml(
-            "seestar_initialization",
-            "move_arm_lon_sec",
-            float(req.media["move_arm_lon_sec"]),
-        )
         self.set_toml("seestar_initialization", "is_EQ_mode", "is_EQ_mode" in req.media)
         self.set_toml(
             "seestar_initialization", "guest_mode_init", "init_guest_mode" in req.media
+        )
+        self.set_toml(
+            "seestar_initialization",
+            "dec_pos_index",
+            int(req.media["dec_pos_index"]),
         )
         self.set_toml(
             "seestar_initialization",
@@ -537,45 +539,13 @@ class _Config:
         """
         ssHTML = ""
         for seestar in self.seestars:
-            if "move_arm_lat_sec" in seestar:
-                lat = self.render_text(
-                    "ss_move_arm_lat_sec",
-                    "Aim Lat",
-                    seestar["move_arm_lat_sec"],
-                    "Start up move arm setting for moving up/down from zenith in movement clock seconds, from -20 to 20",
-                )
-            else:
-                lat = self.render_text(
-                    "ss_move_arm_lat_sec",
-                    "Aim Lat",
-                    2,
-                    "Start up move arm setting for moving up/down from zenith in movement clock seconds, from -20 to 20",
-                )
-
-            if "move_arm_lon_sec" in seestar:
-                lon = self.render_text(
-                    "ss_move_arm_lon_sec",
-                    "Aim Long",
-                    seestar["move_arm_lon_sec"],
-                    "Start up move arm setting for moving counter/clockwise from zenith in movement clock seconds, from -100 to 100",
-                )
-            else:
-                lon = self.render_text(
-                    "ss_move_arm_lon_sec",
-                    "Aim Long",
-                    20,
-                    "Start up move arm setting for moving counter/clockwise from zenith in movement clock seconds, from -100 to 100",
-                )
-
             c = ""
-            h = "False"
 
             if "is_EQ_mode" in seestar:
                 if self.strToBool(seestar["is_EQ_mode"]):
                     c = "checked"
-                    h = "True"
 
-            ssHTML += f'''<div id="device_div_{seestar["device_num"]}">
+            ssHTML += f"""<div id="device_div_{seestar["device_num"]}">
                                 <div class="col-sm-4 text-end">
                                     <label class="form-label">
                                     <h3>Device number {seestar["device_num"]}</h3>
@@ -583,9 +553,6 @@ class _Config:
                                 </div>
                                 {self.render_text("ss_name", "Name", seestar["name"], required=True)}
                                 {self.render_text("ss_ip_address", "IP Address", seestar["ip_address"], required=True)}
-                                {lat}
-                                {lon}
-                                <input id="ss_is_EQ_mode_hidden_{seestar["device_num"]}" name="ss_is_EQ_mode" type="hidden" value="{h}">
 
                                 <div class="row mb-3 align-items-center"> <!-- Checkbox Row -->
                                     <div class="col-sm-4 text-end"> <!-- Checkbox label -->
@@ -594,14 +561,14 @@ class _Config:
                                         </label>
                                     </div> <!-- Close checkbox label -->
                                     <div class="col-sm-8 col-md-6"> <!-- Checkbox -->
-                                        <input id="ss_is_EQ_mode_{seestar["device_num"]}" class="form-check-input" title="Is device in EQ mode" type="checkbox" {c}>
+                                        <input id="ss_is_EQ_mode_{seestar["device_num"]}" name="ss_is_EQ_mode_{seestar["device_num"]}" class="form-check-input" title="Is device in EQ mode" type="checkbox" {c}>
                                     </div> <!--Close checkbox -->
                                 </div> <!-- Close checkbox row -->
                                 {self.render_checkbox(f"delete_{seestar['device_num']}", "Delete device", False)}
 
                             </div>
 
-                        '''
+                        """
 
         ret = f"""
                 <div class="row mb-3 align-items-center">
@@ -728,6 +695,36 @@ class _Config:
                     "Loading gif:",
                     self.loading_gif,
                     "Filename of loading gif to use on live view page",
+                )
+                + self.render_text(
+                    "text_color",
+                    "UI text color:",
+                    self.webui_text_color,
+                    "CSS color value for text (leave blank to use theme default)",
+                )
+                + self.render_text(
+                    "font_family",
+                    "UI font family:",
+                    self.webui_font_family,
+                    "CSS font-family stack, e.g. 'Roboto, sans-serif'",
+                )
+                + self.render_text(
+                    "font_url",
+                    "UI font URL:",
+                    self.webui_font_url,
+                    "Optional stylesheet URL for web fonts (e.g. Google Fonts)",
+                )
+                + self.render_text(
+                    "link_color",
+                    "UI link color:",
+                    self.webui_link_color,
+                    "CSS color value for links (leave blank to use theme default)",
+                )
+                + self.render_text(
+                    "accent_color",
+                    "UI accent color:",
+                    self.webui_accent_color,
+                    "CSS color value for primary UI accents (buttons, switches, highlights)",
                 ),
             )
             + self.render_config_section(
@@ -877,18 +874,6 @@ class _Config:
                     self.init_dew_heater_power,
                     "Dew heater power level, 0 - 100",
                 )
-                + self.render_text(
-                    "move_arm_lat_sec",
-                    "Scope aim latitude:",
-                    self.move_arm_lat_sec,
-                    "Start up raise arm setting for moving up/down from zenith in movement clock seconds, from -20 to 20",
-                )
-                + self.render_text(
-                    "move_arm_lon_sec",
-                    "Scope aim longitude:",
-                    self.move_arm_lon_sec,
-                    "Start up raise arm setting for moving counter/clockwise from zenith in movement clock seconds, from -100 to 100",
-                )
                 + self.render_checkbox(
                     "is_EQ_mode",
                     "Scope in EQ Mode:",
@@ -900,6 +885,12 @@ class _Config:
                     "Claim guest mode control:",
                     self.init_guest_mode,
                     "Claim guest mode on init",
+                )
+                + self.render_text(
+                    "dec_pos_index",
+                    "Dec Offset:",
+                    self.dec_pos_index,
+                    "Set Dec Offset for EQ Polar Alignment, 1-5",
                 )
                 + self.render_text(
                     "battery_low_limit",

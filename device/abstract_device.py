@@ -19,7 +19,7 @@ class MessageParams(TypedDict):
     result: NotRequired[str]
 
 
-type ScheduleState = Literal["working", "stopped", "stopping", "paused", "complete"]
+ScheduleState = Literal["working", "stopped", "stopping", "paused", "complete"]
 
 
 class Schedule(TypedDict):
@@ -50,6 +50,10 @@ class AbstractDevice(ABC):
 
     @abstractmethod
     def get_event_state(self, params=None):
+        pass
+
+    @abstractmethod
+    def reset_scheduler_cur_item(self, params=None):
         pass
 
     @abstractmethod

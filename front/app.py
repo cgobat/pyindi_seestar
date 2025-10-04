@@ -124,9 +124,10 @@ def flash(resp, message):
 
 def get_messages() -> list[str]:
     if len(messages) > 0:
-        resp = messages
+        # Return a snapshot to avoid returning a reference to the cleared list
+        out = messages[:]
         messages.clear()
-        return resp
+        return out
     return []
 
 
@@ -186,6 +187,11 @@ def _get_context_real(telescope_id, req):
     experimental = Config.experimental
     confirm = Config.confirm
     uitheme = Config.uitheme
+    webui_text_color = Config.webui_text_color
+    webui_font_family = Config.webui_font_family
+    webui_font_url = Config.webui_font_url
+    webui_link_color = Config.webui_link_color
+    webui_accent_color = Config.webui_accent_color
     defgain = Config.init_gain
     if telescope_id > 0:
         telescope = get_telescope(telescope_id)
@@ -237,6 +243,11 @@ def _get_context_real(telescope_id, req):
         "experimental": experimental,
         "confirm": confirm,
         "uitheme": uitheme,
+        "webui_text_color": webui_text_color,
+        "webui_font_family": webui_font_family,
+        "webui_font_url": webui_font_url,
+        "webui_link_color": webui_link_color,
+        "webui_accent_color": webui_accent_color,
         "client_master": client_master,
         "current_item": current_item,
         "current_stack": current_stack,
@@ -291,31 +302,52 @@ def update_twilight_times(latitude=None, longitude=None):
         observer.lat = str(latitude)  # ephem likes str
         observer.lon = str(longitude)  # ephem likes str
 
+    # ephim lib erroneously raises an exception at times saying the Sun is above horizon
+    # when it is not.  This is a bug in the ephem library.  This is a workaround.
+
     # Sunrise & Sunset
-    loc_sunset = pytz.utc.localize(observer.next_setting(sun).datetime()).astimezone(
-        local_timezone
-    )
-    loc_next_sunrise = pytz.utc.localize(
-        observer.next_rising(sun).datetime()
-    ).astimezone(local_timezone)
+    try:
+        loc_sunset = pytz.utc.localize(
+            observer.next_setting(sun).datetime()
+        ).astimezone(local_timezone)
+    except Exception:
+        loc_sunset = "Error"
+    try:
+        loc_next_sunrise = pytz.utc.localize(
+            observer.next_rising(sun).datetime()
+        ).astimezone(local_timezone)
+    except Exception:
+        loc_next_sunrise = "Error"
 
     # Civil Beginning and End
     observer.horizon = "-6"  # -6=civil twilight, -12=nautical, -18=astronomical
-    loc_end_civil = pytz.utc.localize(
-        observer.next_setting(sun, use_center=True).datetime()
-    ).astimezone(local_timezone)
-    loc_next_beg_civil = pytz.utc.localize(
-        observer.next_rising(sun, use_center=True).datetime()
-    ).astimezone(local_timezone)
+    try:
+        loc_end_civil = pytz.utc.localize(
+            observer.next_setting(sun, use_center=True).datetime()
+        ).astimezone(local_timezone)
+    except Exception:
+        loc_end_civil = "Error"
+    try:
+        loc_next_beg_civil = pytz.utc.localize(
+            observer.next_rising(sun, use_center=True).datetime()
+        ).astimezone(local_timezone)
+    except Exception:
+        loc_next_beg_civil = "Error"
 
     # Astronomical Beginning and End
     observer.horizon = "-18"  # -6=civil twilight, -12=nautical, -18=astronomical
-    loc_beg_astronomical = pytz.utc.localize(
-        observer.next_setting(sun, use_center=True).datetime()
-    ).astimezone(local_timezone)
-    loc_next_end_astronomical = pytz.utc.localize(
-        observer.next_rising(sun, use_center=True).datetime()
-    ).astimezone(local_timezone)
+    try:
+        loc_beg_astronomical = pytz.utc.localize(
+            observer.next_setting(sun, use_center=True).datetime()
+        ).astimezone(local_timezone)
+    except Exception:
+        loc_beg_astronomical = "Error"
+    try:
+        loc_next_end_astronomical = pytz.utc.localize(
+            observer.next_rising(sun, use_center=True).datetime()
+        ).astimezone(local_timezone)
+    except Exception:
+        loc_next_end_astronomical = "Error"
 
     twilight_times = {
         "Today's Date": current_date_formatted,
@@ -688,107 +720,111 @@ def get_guestmode_state(telescope_id):
 
 def get_device_state(telescope_id):
     if check_api_state(telescope_id):
-        # print("Device is online", telescope_id)
         result = method_sync("get_device_state", telescope_id)
         status = method_sync("get_view_state", telescope_id)
         wifi_status = method_sync("pi_station_state", telescope_id)
-        view_state = "Idle"
-        mode = ""
-        stage = ""
+
+        # Initialize variables with defaults using pydash.get
+        view_state = pydash.get(status, "View.state", "Idle")
+        mode = pydash.get(status, "View.mode", "")
+        stage = pydash.get(status, "View.stage", "")
+        target = pydash.get(status, "View.target_name", "")
+
+        # Simplify stack info access
+        stack_state = pydash.get(status, "View.Stack.state")
+        stacked = (
+            pydash.get(status, "View.Stack.stacked_frame", "")
+            if stack_state == "working"
+            else ""
+        )
+        failed = (
+            pydash.get(status, "View.Stack.dropped_frame", "")
+            if stack_state == "working"
+            else ""
+        )
+
         wifi_signal = ""
-        device = ""
-        focuser = ""
-        settings = ""
-        pi_status = ""
-        free_storage = ""
-        target = ""
-        stacked = ""
-        failed = ""
+        free_storage = "Unknown"
+        guestmode = False
+        is_master = False
         client_master = True
         client_list = ""
-        if status is not None:
-            view_info = status.get("View", {})
-            view_state = view_info.get("state", "Idle")
-            mode = view_info.get("mode", "")
-
-            target = view_info.get("target_name", "")
-            stage = view_info.get("stage", "")
-            stack_info = view_info.get("Stack", {})
-
-            if stack_info.get("state") == "working":
-                stacked = stack_info.get("stacked_frame", "")
-                failed = stack_info.get("dropped_frame", "")
+        mount_mode = "Unknown"
 
         # Check for bad data
         if status is not None and result is not None:
-            guestmode = False
-            is_master = False
-            master_idx = -1
-            client_list = []
             schedule = do_action_device("get_schedule", telescope_id, {})
+
             if result is not None:
-                device = result.get("device", {})
-                focuser = result.get("focuser", {})
-                settings = result.get("setting", {})
-                pi_status = result.get("pi_status", {})
-                storage = result.get("storage", {}).get("storage_volume", [{}])[0]
-                if storage.get("state") == "mounted":
-                    free_storage = humanize.naturalsize(
-                        storage.get("freeMB", 0) * 1024 * 1024
-                    )
-                elif storage.get("state") == "connected":
+                # Get Mount Mode
+                eq_mode = pydash.get(result, "mount.equ_mode", False)
+                mount_mode = "Equatorial" if eq_mode else "Alt Azimuth"
+
+                # Get storage information directly
+                storage_state = pydash.get(
+                    result, "storage.storage_volume[0].state", ""
+                )
+
+                if storage_state == "mounted":
+                    free_mb = pydash.get(result, "storage.storage_volume[0].freeMB", 0)
+                    free_storage = humanize.naturalsize(free_mb * 1024 * 1024)
+                elif storage_state == "connected":
                     free_storage = "Unavailable while in USB storage mode."
 
-                fw = device.get("firmware_ver_int", 0)
+                # Get firmware version directly
+                fw = pydash.get(result, "device.firmware_ver_int", 0)
+
                 if fw > 2300:
-                    if fw >= 2400:
-                        guestmode = settings.get("guest_mode", False)
-                    else:
-                        guestmode = True
+                    # Get guest mode setting directly
+                    guestmode = (
+                        pydash.get(result, "setting.guest_mode", False)
+                        if fw >= 2400
+                        else True
+                    )
 
                     if guestmode:
-                        client_master = result.get("client", {"is_master": False}).get(
-                            "is_master", False
-                        )
-                        clients = result.get("client", {"connected": []}).get(
-                            "connected", []
-                        )
-                        master_idx = result.get("client", {"master_index": -1}).get(
-                            "master_index", -1
-                        )
-                        if master_idx >= 0:
+                        # Get client information directly
+                        client_master = pydash.get(result, "client.is_master", False)
+                        clients = pydash.get(result, "client.connected", [])
+                        master_idx = pydash.get(result, "client.master_index", -1)
+
+                        if 0 <= master_idx < len(clients):
                             clients[master_idx] = "master:" + clients[master_idx]
                         client_list = "<br>".join(clients)
 
+            # Safely access wifi_status
             if wifi_status is not None:
-                if (
-                    wifi_status.get("server", False)
-                    and not guestmode
-                    or guestmode
-                    and is_master
-                ):  # sig_lev is only there while in station mode.
-                    wifi_signal = f"{wifi_status['sig_lev']} dBm"
+                is_server = pydash.get(wifi_status, "server", False)
+                sig_lev = pydash.get(wifi_status, "sig_lev", "N/A")
+
+                if (is_server and not guestmode) or (guestmode and is_master):
+                    wifi_signal = f"{sig_lev} dBm"
                 elif guestmode:
                     wifi_signal = "Unavailable in Guest mode."
                 else:
                     wifi_signal = "Unavailable in AP mode."
+
+            # Build stats dictionary using direct pydash.get access
             stats = {
-                "Firmware Version": device.get("firmware_ver_string", ""),
-                "Focal Position": focuser.get("step", ""),
-                "Auto Power Off": settings.get("auto_power_off", ""),
-                "Heater?": settings.get("heater_enable", ""),
+                "Firmware Version": pydash.get(
+                    result, "device.firmware_ver_string", ""
+                ),
+                "Focal Position": pydash.get(result, "focuser.step", ""),
+                "Auto Power Off": pydash.get(result, "setting.auto_power_off", ""),
+                "Heater?": pydash.get(result, "setting.heater_enable", ""),
                 "Free Storage": free_storage,
-                "Balance Sensor (angle)": result.get("balance_sensor", {})
-                .get("data", {})
-                .get("angle"),
-                "Compass Sensor (direction)": result.get("compass_sensor", {})
-                .get("data", {})
-                .get("direction"),
-                "Temperature Sensor": pi_status.get("temp", ""),
-                "Charge Status": pi_status.get("charger_status", ""),
-                "Battery %": pi_status.get("battery_capacity", ""),
-                "Battery Temp": pi_status.get("battery_temp", ""),
-                "Scheduler Status": schedule.get("Value", {}).get("state"),
+                "Balance Sensor (angle)": pydash.get(
+                    result, "balance_sensor.data.angle"
+                ),
+                "Compass Sensor (direction)": pydash.get(
+                    result, "compass_sensor.data.direction"
+                ),
+                "Temperature Sensor": pydash.get(result, "pi_status.temp", ""),
+                "Charge Status": pydash.get(result, "pi_status.charger_status", ""),
+                "Battery %": pydash.get(result, "pi_status.battery_capacity", ""),
+                "Battery Temp": pydash.get(result, "pi_status.battery_temp", ""),
+                "Mount Mode": mount_mode,
+                "Scheduler Status": pydash.get(schedule, "Value.state"),
                 "View State": view_state,
                 "View Mode": mode,
                 "View Stage": stage,
@@ -798,17 +834,15 @@ def get_device_state(telescope_id):
                 "Wi-Fi Signal": wifi_signal,
             }
 
-            if device.get("firmware_ver_int", 0) > 2300:
+            # Add guest mode stats if firmware supports it
+            if fw > 2300:
                 stats["Master client"] = client_master
                 stats["Client list"] = client_list
 
         else:
             logger.info("Stats: Unable to get data.")
-            stats = {
-                "Info": "Unable to get stats."
-            }  # Display information for the stats page VS blank page.
+            stats = {"Info": "Unable to get stats."}
     else:
-        # print("Device is OFFLINE", telescope_id)
         stats = {}
     return stats
 
@@ -825,30 +859,33 @@ def get_device_settings(telescope_id):
         stack_settings_result = method_sync("get_stack_setting", telescope_id)
 
         settings = {
-            "stack_dither_pix": settings_result["stack_dither"]["pix"],
-            "stack_dither_interval": settings_result["stack_dither"]["interval"],
-            "stack_dither_enable": settings_result["stack_dither"]["enable"],
-            "exp_ms_stack_l": settings_result["exp_ms"]["stack_l"],
-            "exp_ms_continuous": settings_result["exp_ms"]["continuous"],
-            "save_discrete_ok_frame": stack_settings_result["save_discrete_ok_frame"],
-            "save_discrete_frame": stack_settings_result["save_discrete_frame"],
-            "light_duration_min": stack_settings_result["light_duration_min"],
-            "auto_3ppa_calib": settings_result["auto_3ppa_calib"],
-            "frame_calib": settings_result["frame_calib"],
-            # "stack_masic": settings_result["stack_masic"],
-            # "rec_stablzn": settings_result["rec_stablzn"], # Unavailable for firmware 3.11
-            "manual_exp": settings_result["manual_exp"],
-            # "isp_exp_ms": settings_result["isp_exp_ms"],
-            # "calib_location": settings_result["calib_location"],
-            # "wide_cam": settings_result["wide_cam"],
-            # "temp_unit": settings_result["temp_unit"],
-            "focal_pos": settings_result["focal_pos"],
-            # "factory_focal_pos": settings_result["factory_focal_pos"],
-            "heater_enable": settings_result["heater_enable"],
-            "auto_power_off": settings_result["auto_power_off"],
-            "stack_lenhance": settings_result["stack_lenhance"],
+            "stack_dither_pix": pydash.get(settings_result, "stack_dither.pix"),
+            "stack_dither_interval": pydash.get(
+                settings_result, "stack_dither.interval"
+            ),
+            "stack_dither_enable": pydash.get(settings_result, "stack_dither.enable"),
+            "exp_ms_stack_l": pydash.get(settings_result, "exp_ms.stack_l"),
+            "exp_ms_continuous": pydash.get(settings_result, "exp_ms.continuous"),
+            "save_discrete_ok_frame": pydash.get(
+                stack_settings_result, "save_discrete_ok_frame"
+            ),
+            "save_discrete_frame": pydash.get(
+                stack_settings_result, "save_discrete_frame"
+            ),
+            "light_duration_min": pydash.get(
+                stack_settings_result, "light_duration_min"
+            ),
+            "auto_3ppa_calib": pydash.get(settings_result, "auto_3ppa_calib"),
+            "frame_calib": pydash.get(settings_result, "frame_calib"),
+            "manual_exp": pydash.get(settings_result, "manual_exp"),
+            "focal_pos": pydash.get(settings_result, "focal_pos"),
+            "heater_enable": pydash.get(settings_result, "heater_enable"),
+            "auto_power_off": pydash.get(settings_result, "auto_power_off"),
+            "stack_lenhance": pydash.get(settings_result, "stack_lenhance"),
+            "dark_mode": pydash.get(settings_result, "dark_mode"),
+            "stack_cont_capt": pydash.get(settings_result, "stack.cont_capt"),
+            "stack_drizzle2x": pydash.get(settings_result, "stack.drizzle2x"),
         }
-
     return settings
 
 
@@ -916,31 +953,31 @@ def check_dec_value(decString):
 
 
 def hms_to_sec(timeString):
-    hms_search = re.search(
-        r"^(?!\s*$)\s*(?:(\d+)\s*h\s*)?(?:(\d+)\s*m\s*)?(?:(\d+)\s*s)?\s*$",
-        timeString.lower(),
+    timeString = timeString.strip().lower()
+
+    # Case 1: Pure number (int or float) = seconds
+    if re.fullmatch(r"\d+(\.\d+)?", timeString):
+        return int(float(timeString))  # Convert to float then int
+
+    # Case 2: Match h/m/s with optional decimals
+    match = re.match(
+        r"""^
+            (?:(\d+(?:\.\d+)?)\s*h\s*)?   # Hours (optional)
+            (?:(\d+(?:\.\d+)?)\s*m\s*)?   # Minutes (optional)
+            (?:(\d+(?:\.\d+)?)\s*s\s*)?   # Seconds (optional)
+        $""",
+        timeString,
+        re.VERBOSE,
     )
 
-    # Check if convertion is needed.
-    if hms_search:
-        seconds = 0
-        # Convert to sec
-        hms_split = re.split(
-            r"^(?!\s*$)\s*(?:(\d+)\s*h\s*)?(?:(\d+)\s*m\s*)?(?:(\d+)\s*s)?\s*$",
-            timeString.lower(),
-        )
-        if hms_split[1] is not None:
-            # h
-            seconds = int(hms_split[1]) * 3600
-        if hms_split[2] is not None:
-            # m
-            seconds = seconds + int(hms_split[2]) * 60
-        if hms_split[3] is not None:
-            # s
-            seconds = seconds + int(hms_split[3])
-        return seconds
-    else:
-        return timeString
+    if match:
+        hours = float(match.group(1)) if match.group(1) else 0
+        minutes = float(match.group(2)) if match.group(2) else 0
+        seconds = float(match.group(3)) if match.group(3) else 0
+        return int(hours * 3600 + minutes * 60 + seconds)
+
+    # Case 3: Invalid format
+    return timeString
 
 
 def lat_lng_distance_in_km(lat1, lng1, lat2, lng2):
@@ -1220,40 +1257,6 @@ def do_command(req, resp, telescope_id):
     value = form.get("command", "").strip()
     # print ("Selected command: ", value)
     match value:
-        case "start_up_sequence":
-            lat = form.get("lat", "").strip()
-            long = form.get("long", "").strip()
-            auto_focus = form.get("auto_focus", "False").strip() == "on"
-            dark_frames = form.get("dark_frames", "False").strip() == "on"
-            polar_align = form.get("polar_align", "False").strip() == "on"
-            move_arm = form.get("move_arm", "False").strip() == "on"
-
-            # print(f"action_start_up_sequence - Latitude {lat} Longitude {long}")
-            if not lat or not long:
-                output = do_action_device(
-                    "action_start_up_sequence",
-                    telescope_id,
-                    {
-                        "auto_focus": auto_focus,
-                        "dark_frames": dark_frames,
-                        "3ppa": polar_align,
-                        "move_arm": move_arm,
-                    },
-                )
-            else:
-                output = do_action_device(
-                    "action_start_up_sequence",
-                    telescope_id,
-                    {
-                        "lat": float(lat),
-                        "lon": float(long),
-                        "auto_focus": auto_focus,
-                        "dark_frames": dark_frames,
-                        "3ppa": polar_align,
-                        "move_arm": move_arm,
-                    },
-                )
-            return output
         case "adjust_mag_declination":
             adjust_mag_dec = form.get("adjust_mag_dec", "False").strip() == "on"
             fudge_angle = form.get("fudge_angle", "").strip()
@@ -1279,6 +1282,8 @@ def do_command(req, resp, telescope_id):
         case "get_event_state":
             output = do_action_device("get_event_state", telescope_id, {})
             return output
+        case "reset_scheduler_cur_item":
+            output = do_action_device("reset_scheduler_cur_item", telescope_id, {})
         case "scope_park":
             output = method_sync("scope_park", telescope_id)
             return output
@@ -1339,8 +1344,11 @@ def do_command(req, resp, telescope_id):
         case "start_create_dark":
             output = method_sync("start_create_dark", telescope_id)
             return output
-        case "stop_create_dark":
-            output = method_sync("stop_create_dark", telescope_id)
+        case "start_create_calib_frame":
+            output = method_sync("start_create_calib_frame")
+            return output
+        case "start_create_hpc":
+            output = method_sync("start_create_hpc")
             return output
         case "pi_get_ap":
             output = method_sync("pi_get_ap", telescope_id)
@@ -1412,6 +1420,20 @@ def do_command(req, resp, telescope_id):
                 "method_sync",
                 telescope_id,
                 {"method": "set_setting", "params": {"master_cli": False}},
+            )
+            return output
+        case "set_eq_mode":
+            output = do_action_device(
+                "method_sync",
+                telescope_id,
+                {"method": "scope_park", "params": {"equ_mode": True}},
+            )
+            return output
+        case "set_alt_az_mode":
+            output = do_action_device(
+                "method_sync",
+                telescope_id,
+                {"method": "scope_park", "params": {"equ_mode": False}},
             )
             return output
         case _:
@@ -1523,15 +1545,20 @@ def render_template(req, resp, template_name, **context):
     template = fetch_template(template_name)
     resp.status = falcon.HTTP_200
     resp.content_type = "text/html"
-    webui_theme = Config.uitheme
     version = Version.app_version()
+    merged_context = dict(context)
+    merged_context.setdefault("webui_theme", Config.uitheme)
+    merged_context.setdefault("webui_text_color", Config.webui_text_color)
+    merged_context.setdefault("webui_font_family", Config.webui_font_family)
+    merged_context.setdefault("webui_font_url", Config.webui_font_url)
+    merged_context.setdefault("webui_link_color", Config.webui_link_color)
+    merged_context.setdefault("webui_accent_color", Config.webui_accent_color)
+    merged_context.setdefault("version", version)
 
     resp.text = template.render(
         flashed_messages=get_flash_cookie(req, resp),
         messages=get_messages(),
-        webui_theme=webui_theme,
-        version=version,
-        **context,
+        **merged_context,
     )
 
 
@@ -1692,7 +1719,6 @@ def import_csv_schedule(input, telescope_id):
                 )
             case "start_up_sequence":
                 startup_params = {
-                    "move_arm": params.get("move_arm"),
                     "auto_focus": params.get("auto_focus"),
                     "3ppa": params.get("polar_align"),
                     "dark_frames": params.get("dark_frames"),
@@ -2274,7 +2300,6 @@ class ScheduleStartupResource:
     @staticmethod
     def on_post(req, resp, telescope_id=0):
         data = req.media
-        move_arm = data.get("move_arm") == "on"
         auto_focus = data.get("auto_focus") == "on"
         polar_align = data.get("polar_align") == "on"
         dark_frames = data.get("dark_frames") == "on"
@@ -2292,7 +2317,6 @@ class ScheduleStartupResource:
                     "auto_focus": auto_focus,
                     "dark_frames": dark_frames,
                     "3ppa": polar_align,
-                    "move_arm": move_arm,
                 },
                 telescope_id,
             )
@@ -2303,7 +2327,6 @@ class ScheduleStartupResource:
                     "auto_focus": auto_focus,
                     "dark_frames": dark_frames,
                     "3ppa": polar_align,
-                    "move_arm": move_arm,
                 },
                 selected_items,
                 telescope_id,
@@ -2451,11 +2474,9 @@ class ScheduleExposureResource:
         online = check_api_state(telescope_id)
         if not online:
             telescope_id = 0
+
         settings = method_sync("get_setting", telescope_id)
-        if settings:
-            defexp = settings["exp_ms"]["stack_l"]
-        else:
-            defexp = Config.init_expo_stack_ms
+        defexp = pydash.get(settings, "exp_ms.stack_l", Config.init_expo_stack_ms)
         values = {"defexp": int(defexp)}
         render_schedule_tab(
             req, resp, telescope_id, "schedule_exposure.html", "exposure", values, {}
@@ -2464,9 +2485,9 @@ class ScheduleExposureResource:
     @staticmethod
     def on_post(req, resp, telescope_id=0):
         data = req.media
-        expValue = data.get("exposure")
-        action = data.get("action", "")
-        selected_items = data.get("selected_items", [])
+        expValue = pydash.get(data, "exposure", 10000)
+        action = pydash.get(data, "action", "")
+        selected_items = pydash.get(data, "selected_items", [])
 
         online = check_api_state(telescope_id)
         if not online:
@@ -2710,10 +2731,14 @@ class ScheduleUploadResource:
         redirect(f"/{telescope_id}/schedule")
 
 
-class ScheduleRefreshResource(BaseResource):
+class ScheduleReStartResource(BaseResource):
     def on_get(self, req, resp, telescope_id=0):
+        do_action_device("reset_scheduler_cur_item", telescope_id, {})
         context = get_context(telescope_id, req)
         current = do_action_device("get_schedule", telescope_id, {})
+        context.get("current_item")["schedule_item_id"] = (
+            ""  # context may have been cached, so reset current item id
+        )
         if current is not None:
             schedule = current.get("Value", {})
             state = schedule.get("state", "")
@@ -2722,8 +2747,8 @@ class ScheduleRefreshResource(BaseResource):
             state = "stopped"
 
         html = self.render_schedule_list_html(req, resp, schedule, context)
-
-        resp.media = {"state": state, "html": html}
+        state_html = self.render_schedule_state_html(req, resp, state, context)
+        resp.media = {"state": state, "html": html, "state_html": state_html}
         resp.content_type = "application/json"
         resp.status = falcon.HTTP_200
 
@@ -2738,6 +2763,57 @@ class ScheduleRefreshResource(BaseResource):
             webui_theme=webui_theme,
             version=version,
             schedule=schedule,
+            **context,
+        )
+
+        return html
+
+    def render_schedule_state_html(self, req, resp, state, context):
+        template = fetch_template("partials/schedule_state.html")
+        webui_theme = Config.uitheme
+        version = Version.app_version()
+
+        html = template.render(
+            flashed_messages=get_flash_cookie(req, resp),
+            messages=get_messages(),
+            webui_theme=webui_theme,
+            version=version,
+            state=state,
+            **context,
+        )
+
+        return html
+
+
+class ScheduleRefreshResource(BaseResource):
+    def on_get(self, req, resp, telescope_id=0):
+        context = get_context(telescope_id, req)
+        current = do_action_device("get_schedule", telescope_id, {})
+        if current is not None:
+            schedule = current.get("Value", {})
+            state = schedule.get("state", "")
+        else:
+            schedule = {}
+            state = "stopped"
+
+        html = self.render_schedule_list_html(req, resp, schedule, context)
+        resp.media = {"state": state, "html": html}
+        resp.content_type = "application/json"
+        resp.status = falcon.HTTP_200
+
+    def render_schedule_list_html(self, req, resp, schedule, context):
+        template = fetch_template("partials/schedule_list.html")
+        webui_theme = Config.uitheme
+        version = Version.app_version()
+        open_accordion_id = req.get_param("open_accordion_id", default="")
+
+        html = template.render(
+            flashed_messages=get_flash_cookie(req, resp),
+            messages=get_messages(),
+            webui_theme=webui_theme,
+            version=version,
+            schedule=schedule,
+            open_accordion_id=open_accordion_id,
             **context,
         )
 
@@ -3242,12 +3318,9 @@ class SettingsResource(BaseResource):
                 "continuous": int(PostedSettings["exp_ms_continuous"]),
             },
             "focal_pos": int(PostedSettings["focal_pos"]),
-            # "factory_focal_pos": int(PostedSettings["factory_focal_pos"]),
             "auto_power_off": str2bool(PostedSettings["auto_power_off"]),
             "auto_3ppa_calib": str2bool(PostedSettings["auto_3ppa_calib"]),
             "frame_calib": str2bool(PostedSettings["frame_calib"]),
-            # "stack_masic": str2bool(PostedSettings["stack_masic"]),
-            # "rec_stablzn": str2bool(PostedSettings["rec_stablzn"]),
             "manual_exp": str2bool(PostedSettings["manual_exp"]),
         }
 
@@ -3280,17 +3353,50 @@ class SettingsResource(BaseResource):
             )
 
         settings_output = do_action_device(
-            "method_async",
+            "method_sync",
             telescope_id,
             {"method": "set_setting", "params": FormattedNewSettings},
         )
-        stack_settings_output = do_action_device(
+        # For some stupid reason known only to ZWO, dark_mode is returned by get_setting as a boolean.
+        # However when you set_setting it expects an integer representation of that boolean
+        # Also, it doesn't like to be lumped in with the rest of the set_setting values.
+        # It needs to be on its own.
+        dark_mode_bool = str2bool(PostedSettings["dark_mode"])
+        dark_mode_value = int(dark_mode_bool)
+        dark_mode_output = do_action_device(
             "method_async",
+            telescope_id,
+            {"method": "set_setting", "params": {"dark_mode": dark_mode_value}},
+        )
+        # Live Stack Mode is another one like dark_mode.
+        cont_capt = str2bool(PostedSettings["stack_cont_capt"])
+        LiveModeSettings = {"stack": {"cont_capt": cont_capt}}
+        live_mode_output = do_action_device(
+            "method_sync",
+            telescope_id,
+            {"method": "set_setting", "params": LiveModeSettings},
+        )
+        # 4k Mode is another one like cont_capt
+        drizzle2x = str2bool(PostedSettings["stack_drizzle2x"])
+        DrizzleModeSettings = {"stack": {"drizzle2x": drizzle2x}}
+        drizzle_mode_output = do_action_device(
+            "method_sync",
+            telescope_id,
+            {"method": "set_setting", "params": DrizzleModeSettings},
+        )
+        stack_settings_output = do_action_device(
+            "method_sync",
             telescope_id,
             {"method": "set_stack_setting", "params": FormattedNewStackSettings},
         )
 
-        if settings_output["ErrorNumber"] or stack_settings_output["ErrorNumber"]:
+        if (
+            settings_output["ErrorNumber"]
+            or stack_settings_output["ErrorNumber"]
+            or live_mode_output["ErrorNumber"]
+            or dark_mode_output["ErrorNumber"]
+            or drizzle_mode_output["ErrorNumber"]
+        ):
             output = "Error Updating Settings."
         else:
             output = "Successfully Updated Settings."
@@ -3329,7 +3435,7 @@ class SettingsResource(BaseResource):
             "save_discrete_ok_frame": "Save Sub Frames",
             "save_discrete_frame": "Save Failed Sub Frames",
             "light_duration_min": "Light Duration Min",
-            "auto_3ppa_calib": "Auto 3 Point Calibration",
+            "auto_3ppa_calib": "Horizontal Calibration",
             "frame_calib": "Frame Calibration",
             "stack_masic": "Stack Mosaic",
             "rec_stablzn": "Record Stabilization",
@@ -3343,6 +3449,9 @@ class SettingsResource(BaseResource):
             "heater_enable": "Dew Heater",
             "auto_power_off": "Auto Power Off",
             "stack_lenhance": "Light Pollution (LP) Filter",
+            "dark_mode": "Dark Mode",
+            "stack_cont_capt": "Continuous Capture Mode",
+            "stack_drizzle2x": "4k Live Stack Mode (2x Drizzle)",
         }
         # Maybe we can store this better?
         settings_helper_text = {
@@ -3354,7 +3463,7 @@ class SettingsResource(BaseResource):
             "save_discrete_ok_frame": "Save sub frames. (Doesn't include failed.)",
             "save_discrete_frame": 'Save failed sub frames. (Failed sub frames will have "_failed" added to their filename.)',
             "light_duration_min": "Light Duration Min.",
-            "auto_3ppa_calib": "Enable or disable 3 point calibration.",
+            "auto_3ppa_calib": "In AltAz mode, enable/disable automatic horizontal calibration at the start of an imaging session",
             "frame_calib": "Frame Calibration",
             "stack_masic": "Stack Mosaic",
             "rec_stablzn": "Record Stabilization",
@@ -3368,6 +3477,9 @@ class SettingsResource(BaseResource):
             "heater_enable": "Enable or disable dew heater.",
             "auto_power_off": "Enable or disable auto power off",
             "stack_lenhance": "Enable or disable light pollution (LP) Filter.",
+            "dark_mode": "Enable or disable LEDs while imaging.",
+            "stack_cont_capt": "Enabling continuous capture mode disables live stacking",
+            "stack_drizzle2x": "Enables 2x drizzle on Live Stack for 4k Mode",
         }
         render_template(
             req,
@@ -3444,27 +3556,21 @@ class StartupResource(BaseResource):
         if action == "start":
             lat = form.get("lat", "").strip()
             long = form.get("long", "").strip()
-            move_arm_lat_sec = form.get("move_arm_lat_sec", "").strip()
-            move_arm_lon_sec = form.get("move_arm_lon_sec", "").strip()
             auto_focus = form.get("auto_focus", "False").strip() == "on"
             dark_frames = form.get("dark_frames", "False").strip() == "on"
             polar_align = form.get("polar_align", "False").strip() == "on"
-            move_arm = form.get("move_arm", "False").strip() == "on"
+            dec_pos_index = form.get("dec-offset", Config.dec_pos_index)
 
             params = {
                 "auto_focus": auto_focus,
                 "dark_frames": dark_frames,
                 "3ppa": polar_align,
-                "move_arm": move_arm,
+                "dec_pos_index": int(dec_pos_index),
             }
 
             if lat and long:
                 params["lat"] = float(lat)
                 params["lon"] = float(long)
-
-            if move_arm_lat_sec and move_arm_lon_sec:
-                params["move_arm_lat_sec"] = float(move_arm_lat_sec)
-                params["move_arm_lon_sec"] = float(move_arm_lon_sec)
 
             output = do_action_device("action_start_up_sequence", telescope_id, params)
         elif action == "stop":
@@ -4033,11 +4139,10 @@ class BlindPolarAlignResource:
                 resp.text = json.dumps(pa_data)
         elif action == "runpa":
             polar_align = PostedForm.get("polar_align", "False").strip() == "on"
-            move_arm = PostedForm.get("move_arm", "False").strip() == "on"
             do_action_device(
                 "action_start_up_sequence",
                 telescope_id,
-                {"3ppa": polar_align, "move_arm": move_arm},
+                {"3ppa": polar_align},
             )
             render_template(req, resp, "pa_refine.html", **context)
 
@@ -4331,7 +4436,7 @@ def searchLocal(object):
 class GetCometCoordinates:
     @staticmethod
     def on_get(req, resp):
-        cometName = req.get_param("cometname")
+        cometName = urllib.parse.quote_plus(req.get_param("cometname"))
         rtn = searchComet(cometName)
         if len(rtn) == 0:
             resp.status = falcon.HTTP_404
@@ -4347,7 +4452,7 @@ class GetCometCoordinates:
 class GetMinorPlanetCoordinates:
     @staticmethod
     def on_get(req, resp):
-        minorname = req.get_param("minorname")
+        minorname = urllib.parse.quote_plus(req.get_param("minorname"))
         rtn = searchMinorPlanet(minorname)
         if len(rtn) == 0:
             resp.status = falcon.HTTP_404
@@ -4363,7 +4468,7 @@ class GetMinorPlanetCoordinates:
 class GetLocalSearch:
     @staticmethod
     def on_get(req, resp):
-        searchText = req.get_param("target")
+        searchText = urllib.parse.quote_plus(req.get_param("target"))
         rtn = searchLocal(searchText)
         if len(rtn) == 0:
             resp.status = falcon.HTTP_404
@@ -4379,7 +4484,7 @@ class GetLocalSearch:
 class GetAAVSOSearch:
     @staticmethod
     def on_get(req: falcon.Request, resp: falcon.Response) -> None:
-        objName = req.get_param("target")
+        objName = urllib.parse.quote_plus(req.get_param("target"))
         aavso_URL = (
             "https://www.aavso.org/vsx/index.php?view=api.object&format=json&ident="
         )
@@ -4500,6 +4605,9 @@ class FrontMain:
             "/{telescope_id:int}/schedule/dew-heater", ScheduleDewHeaterResource()
         )
         app.add_route("/{telescope_id:int}/schedule/refresh", ScheduleRefreshResource())
+        app.add_route(
+            "/{telescope_id:int}/schedule/restart_schedule", ScheduleReStartResource()
+        )
         app.add_route("/{telescope_id:int}/schedule/state", ScheduleToggleResource())
         app.add_route(
             "/{telescope_id:int}/schedule/wait-until", ScheduleWaitUntilResource()

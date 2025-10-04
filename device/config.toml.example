@@ -18,6 +18,13 @@ confirm = true	# Enable/Disable the Commands page confirmation dialog
 # save_frames = false
 # save_frames_dir = "."
 
+# CSS overrides
+text_color = ""
+font_family = ""
+font_url = ""
+link_color = ""
+accent_color = ""
+
 [server]
 location = 'Anywhere on Earth'  # Anything you want here
 verbose_driver_exceptions = true
@@ -41,11 +48,10 @@ dither_length_pixel = 50
 dither_frequency = 10
 activate_LP_filter = false
 dew_heater_power = 0                # 0 - 100; 0 is off, 100 is max
-move_arm_lat_sec = 2           # start up raise arm setting for moving up/down from zenith in movement clock seconds, from -20 to 20
-move_arm_lon_sec = 20          # start up raise arm setting for moving counter/clockwise from zenith in movement clock seconds, from -100 to 100
 is_EQ_mode = true           # set to false if you want the old standard alt-az mode
 guest_mode_init = true
 battery_low_limit = 3
+dec_pos_index = 3       # 1-5; 1 = Dec Arm pointing North,  3 = Dec Arm pointing at Zenith, 5 = Dec Arm pointing South
 is_frame_calibrated = true
 
 [logging]
@@ -62,8 +68,6 @@ name = "Seestar Alpha"
 ip_address = "seestar.local"
 device_num = 1
 # You can specify the following settings to override those found in the seestar_initialization section on a per-device level
-#move_arm_lat_sec = 2           # start up raise arm setting for moving up/down from zenith in movement clock seconds, from -20 to 20
-#move_arm_lon_sec = 20          # start up raise arm setting for moving counter/clockwise from zenith in movement clock seconds, from -100 to 100
 #is_EQ_mode = false          # can be used to override default
 
 #[[seestars]]

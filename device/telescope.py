@@ -24,7 +24,7 @@ from device.shr import (
 )
 from device.exceptions import *  # Nothing but exception classes
 from device.seestar_device import Seestar
-from seestar_federation import Seestar_Federation
+from device.seestar_federation import Seestar_Federation
 from alpaca.telescope import *
 import json
 from device.seestar_util import Util  # RWR
@@ -199,6 +199,9 @@ class action:
             if action_name == "get_event_state":
                 result = cur_dev.get_event_state(params)
                 resp.text = MethodResponse(req, value=result).json
+            elif action_name == "reset_scheduler_cur_item":
+                result = cur_dev.reset_scheduler_cur_item(params)
+                resp.text = MethodResponse(req, value=result).json
             elif action_name == "play_sound":
                 result = cur_dev.play_sound(params["id"])
                 resp.text = MethodResponse(req, value=result).json
@@ -317,7 +320,7 @@ class action:
             resp.text = MethodResponse(
                 req, DevDriverException(0x500, "\n".join(ex.args), ex)
             ).json
-            cur_dev.logger.warn("Error making request: {ex}")
+            cur_dev.logger.warn(f"Error making request: {ex}")
 
 
 @before(PreProcessRequest(maxdev))

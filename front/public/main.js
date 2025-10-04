@@ -96,7 +96,7 @@ async function fetchCoordinates() {
             }
             // Grab request text
             planet = document.getElementById('targetName').value;
-            queryURL = '/getplanetcoordinates?planetname=' + planet;
+            queryURL = '/getplanetcoordinates?planetname=' + encodeURIComponent(planet);
             // Moon / Sun doesn't have 'BARYCENTER' after it but more checks needed for Sun first so just do Moon
             if (planet.toLowerCase() != 'moon') {queryURL += " BARYCENTER"};
             fetch(queryURL)
@@ -133,7 +133,7 @@ async function fetchCoordinates() {
                 return;
             }
             minorname = document.getElementById('targetName').value;
-            queryURL = '/getminorplanetcoordinates?minorname=' + minorname;
+            queryURL = '/getminorplanetcoordinates?minorname=' + encodeURIComponent(minorname);
             fetch(queryURL)
             .then(response => {
                 // If a server error or object not found
@@ -168,7 +168,7 @@ async function fetchCoordinates() {
                 return;
             }
             cometname = document.getElementById('targetName').value;
-            queryURL = '/getcometcoordinates?cometname=' + cometname;
+            queryURL = '/getcometcoordinates?cometname=' + encodeURIComponent(cometname);
             fetch(queryURL)
             .then(response => {
                 // If a server error or object not found
@@ -214,7 +214,7 @@ async function fetchCoordinates() {
                 return;
             }
             starName = document.getElementById('targetName').value;
-            queryURL = '/getaavsocoordinates?target=' + starName;
+            queryURL = '/getaavsocoordinates?target=' + encodeURIComponent(starName);
             fetch(queryURL)
             .then(response => {
                 // If a server error or object not found
@@ -460,38 +460,6 @@ function addSeestar(){
                                 <div class="col-sm-8 col-md-6">
                                     <!-- Col -->
                                     <input id="ss_ip_address" name="ss_ip_address" type="text" class="form-control" title="" value="" required>
-                                </div>
-                                <!-- Close Col -->
-                            </div>
-                            <!-- Close Row -->
-                            <div class="row mb-3 align-items-center">
-                                <!-- Row -->
-                                <div class="col-sm-4 text-end">
-                                    <!-- Col -->
-                                    <label for="ss_move_arm_lat_sec" class="form-label">
-                                    Aim Lat
-                                    </label>
-                                </div>
-                                <!-- Close Col -->
-                                <div class="col-sm-8 col-md-6">
-                                    <!-- Col -->
-                                    <input id="ss_move_arm_lat_sec" name="ss_move_arm_lat_sec" type="number" class="form-control" title="start up move latitude time in seconds -20 to 20" value="2.0" >
-                                </div>
-                                <!-- Close Col -->
-                            </div>
-                            <!-- Close Row -->
-                            <div class="row mb-3 align-items-center">
-                                <!-- Row -->
-                                <div class="col-sm-4 text-end">
-                                    <!-- Col -->
-                                    <label for="ss_move_arm_lon_sec" class="form-label">
-                                    Aim Long
-                                    </label>
-                                </div>
-                                <!-- Close Col -->
-                                <div class="col-sm-8 col-md-6">
-                                    <!-- Col -->
-                                    <input id="ss_move_arm_lon_sec" name="ss_move_arm_lon_sec" type="number" class="form-control" title="start up move longitude time in seconds -100 to 100" value="20.0" >
                                 </div>
                                 <!-- Close Col -->
                             </div>
