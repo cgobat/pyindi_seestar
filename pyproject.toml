@@ -41,7 +41,7 @@ dependencies = [
 ]
 
 [tool.uv.sources]
-pyindi = { git = "https://github.com/MMTObservatory/pyINDI.git", rev = "c12590fbe310c34cadb03713051789a4d76d80c7" }
+pyindi = { git = "https://github.com/MMTObservatory/pyINDI.git", rev = "f6fd121b442f653f5fcaffa7dc1dcf8294566216" }
 
 [tool.ruff]
 target-version = "py312"

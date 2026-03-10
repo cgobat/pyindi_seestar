@@ -858,7 +858,7 @@ wheels = [
 [[package]]
 name = "pyindi"
 version = "0.0.0"
-source = { git = "https://github.com/MMTObservatory/pyINDI.git?rev=c12590fbe310c34cadb03713051789a4d76d80c7#c12590fbe310c34cadb03713051789a4d76d80c7" }
+source = { git = "https://github.com/MMTObservatory/pyINDI.git?rev=f6fd121b442f653f5fcaffa7dc1dcf8294566216" }
 dependencies = [
     { name = "lxml" },
     { name = "pillow" },
@@ -1118,7 +1118,7 @@ requires-dist = [
     { name = "pydantic", specifier = ">=2.11.3" },
     { name = "pydash", specifier = "==8.0.3" },
     { name = "pyhocon", specifier = "==0.3.61" },
-    { name = "pyindi", git = "https://github.com/MMTObservatory/pyINDI.git?rev=c12590fbe310c34cadb03713051789a4d76d80c7" },
+    { name = "pyindi", git = "https://github.com/MMTObservatory/pyINDI.git?rev=f6fd121b442f653f5fcaffa7dc1dcf8294566216" },
     { name = "pylint", specifier = "==3.2.7" },
     { name = "pytz", specifier = "==2022.7.1" },
     { name = "pyyaml", specifier = "~=6.0.1" },
