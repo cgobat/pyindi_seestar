@@ -1613,7 +1613,7 @@ def do_support_bundle(req, telescope_id=1):
     logger.debug("do_support_bundle: getting logs (starting)")
     with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
         # Add logs
-        cwd = Path(os.getcwd())
+        cwd = Path.cwd()
         pfx = cwd.joinpath(Config.log_prefix)
         if pfx == "":
             pfx = "."
