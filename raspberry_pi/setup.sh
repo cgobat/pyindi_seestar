@@ -27,12 +27,23 @@ function validate_access {
 
 function install_apt_packages {
   sudo apt-get update --yes
-  sudo apt-get install --yes software-properties-common \
-    git libssl-dev zlib1g-dev libbz2-dev libreadline-dev \
-    libsqlite3-dev llvm libncurses5-dev libncursesw5-dev \
-    xz-utils tk-dev libgdbm-dev lzma lzma-dev tcl-dev \
-    libxml2-dev libxmlsec1-dev libffi-dev liblzma-dev \
-    wget curl make build-essential openssl libgl1 indi-bin
+  if grep -q trixie /etc/os-release; then
+      # trixie
+      sudo apt-get install --yes \
+          git libssl-dev zlib1g-dev libbz2-dev libreadline-dev \
+          libsqlite3-dev llvm libncurses-dev \
+          xz-utils tk-dev libgdbm-dev lzma tcl-dev \
+          libxml2-dev libxmlsec1-dev libffi-dev liblzma-dev \
+          wget curl make build-essential openssl libgl1 indi-bin
+  else
+      # bookworm
+      sudo apt-get install --yes software-properties-common \
+          git libssl-dev zlib1g-dev libbz2-dev libreadline-dev \
+          libsqlite3-dev llvm libncurses5-dev libncursesw5-dev \
+          xz-utils tk-dev libgdbm-dev lzma lzma-dev tcl-dev \
+          libxml2-dev libxmlsec1-dev libffi-dev liblzma-dev \
+          wget curl make build-essential openssl libgl1 indi-bin
+  fi
 }
 
 function config_toml_setup {
@@ -104,6 +115,7 @@ function systemd_service_setup {
 
   cat systemd/INDI.service | sed \
   -e "s|/home/.*/seestar_alp|$src_home|g" \
+  -e "s|^ExecStartPost=python3|ExecStartPost=$HOME/.pyenv/versions/ssc-3.13.5/bin/python3|" \
   -e "s|^User=.*|User=${user}|g" > /tmp/INDI.service
 
   sudo chown root:root /tmp/seestar.service /tmp/INDI.service /tmp/seestar.env
@@ -130,6 +142,7 @@ function systemd_service_setup {
 
 function network_config {
   sudo bash -c 'echo "net.ipv6.conf.all.disable_ipv6 = 1" > /etc/sysctl.d/98-ssc.conf'
+  sudo touch /etc/sysctl.conf
   sudo sysctl -p
 }
 

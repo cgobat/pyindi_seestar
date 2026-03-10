@@ -88,7 +88,12 @@ class _Config:
         else:
             return default
 
-    def load(self, toml_path):
+    def load(self, toml_path, preloaded_dict=None):
+        if preloaded_dict is not None:
+            self._dict = preloaded_dict
+        else:
+            with open(toml_path) as fp:
+                self._dict = tomlkit.loads(fp.read())
         """
         Load a config.toml file into a Config object.
 
@@ -98,8 +103,6 @@ class _Config:
               - def render_config_html to add/remove html form representation
               - def load_from_form (below) to update this object when the form is submitted
         """
-        self._dict = tomlkit.loads(open(toml_path).read())
-
         """Device configuration in ``config.toml``"""
         # ---------------
         # Network Section
@@ -154,6 +157,7 @@ class _Config:
         self.can_reverse: bool = self.get_toml("device", "can_reverse", True)
         self.step_size: float = self.get_toml("device", "step_size", 1.0)
         self.steps_per_sec: int = self.get_toml("device", "steps_per_sec", 6)
+        self.verify_injection: bool = self.get_toml("device", "verify_injection", True)
         if "seestars" in self._dict:
             self.seestars = self._dict["seestars"]
         else:
@@ -232,8 +236,6 @@ class _Config:
         """
         Save the config html form into a toml file
         """
-        req.get_media()
-
         # Reset arrays
         self.seestars = []
         self._dict["seestars"].clear()
@@ -392,6 +394,7 @@ class _Config:
             "battery_low_limit",
             int(req.media["battery_low_limit"]),
         )
+        self.load(self.path_to_dat, preloaded_dict=self._dict)
 
     def load_toml(self, load_name=None):
         """
@@ -414,8 +417,18 @@ class _Config:
         if save_name is None:
             save_name = self.path_to_dat
         print(f"save_toml: writing toml to {save_name}")
-        with open(save_name, "w") as toml_file:
-            toml_file.write(tomlkit.dumps(self._dict))
+
+        tmp_name = save_name + ".tmp"
+        try:
+            with open(tmp_name, "w") as toml_file:
+                toml_file.write(tomlkit.dumps(self._dict))
+                toml_file.flush()
+                os.fsync(toml_file.fileno())
+            os.replace(tmp_name, save_name)
+        except Exception:
+            if os.path.exists(tmp_name):
+                os.remove(tmp_name)
+            raise
 
     #
     # HTML config rendering

@@ -52,6 +52,14 @@ _last_context_get_time = {}
 _context_cached = {}
 _last_api_state_get_time = {}
 _api_state_cached = {}
+_planning_cards_cache = None
+_planning_cards_cache_mtime = None
+_planning_cards_cache_lock = threading.Lock()
+_csc_sites_cache = None
+_csc_sites_cache_lock = threading.Lock()
+_nearest_csc_cache = {}
+_nearest_csc_cache_ttl_sec = 300
+_nearest_csc_cache_lock = threading.Lock()
 
 
 def get_ip() -> str | None:
@@ -170,7 +178,14 @@ def get_imager_root(telescope_id, req):
             filter(lambda tel: tel["device_num"] == telescope_id, telescopes)
         )[0]
         if telescope:
-            root = f"http://{req.host}:{Config.imgport}/{telescope['device_num']}"
+            # req.host may already include an incoming port, and Firefox rejects
+            # malformed host:port:port URLs. Build a clean origin explicitly.
+            parsed_host = urllib.parse.urlsplit(f"//{req.host}")
+            hostname = parsed_host.hostname or req.host
+            if ":" in hostname and not hostname.startswith("["):
+                hostname = f"[{hostname}]"
+            scheme = getattr(req, "scheme", "http")
+            root = f"{scheme}://{hostname}:{Config.imgport}/{telescope['device_num']}"
             return root
     return ""
 
@@ -184,6 +199,7 @@ def _get_context_real(telescope_id, req):
     client_master = get_client_master(telescope_id)
     segments = req.relative_uri.lstrip("/").split("/", 1)
     partial_path = segments[1] if len(segments) > 1 else segments[0]
+    partial_path = partial_path.split("?", 1)[0].split("#", 1)[0].strip("/")
     experimental = Config.experimental
     confirm = Config.confirm
     uitheme = Config.uitheme
@@ -422,6 +438,7 @@ def get_twilight_times():
 
 
 def get_planning_cards():
+    global _planning_cards_cache, _planning_cards_cache_mtime
     if getattr(
         sys, "frozen", False
     ):  # frozen means that we are running from a bundled app
@@ -446,35 +463,30 @@ def get_planning_cards():
                 os.path.dirname(__file__), "planning.json.example"
             )
         shutil.copyfile(card_state_example_file_location, card_state_file_location)
-
-    with open(card_state_file_location, "r") as card_state_file:
-        state_data = json.load(card_state_file)
-        return state_data
+    file_mtime = os.path.getmtime(card_state_file_location)
+    with _planning_cards_cache_lock:
+        if (
+            _planning_cards_cache is not None
+            and _planning_cards_cache_mtime == file_mtime
+        ):
+            return json.loads(json.dumps(_planning_cards_cache))
+        with open(card_state_file_location, "r") as card_state_file:
+            state_data = json.load(card_state_file)
+        _planning_cards_cache = state_data
+        _planning_cards_cache_mtime = file_mtime
+        return json.loads(json.dumps(state_data))
 
 
 def get_planning_card_state(card_name):
     # Get's the state of a card via planning.json
-    if getattr(
-        sys, "frozen", False
-    ):  # frozen means that we are running from a bundled app
-        planning_state_file_location = os.path.abspath(
-            os.path.join(sys._MEIPASS, "planning.json")
-        )
-    else:
-        planning_state_file_location = os.path.join(
-            os.path.dirname(__file__), "planning.json"
-        )
-
-    with open(planning_state_file_location, "r") as planning_state_file:
-        state_data = json.load(planning_state_file)
-
-    for card in state_data:
+    for card in get_planning_cards():
         # print (card['card_name'])
         if card["card_name"] == card_name:
             return card
 
 
 def update_planning_card_state(card_name, var, value):
+    global _planning_cards_cache, _planning_cards_cache_mtime
     # Update planning.json with current card state
     if getattr(
         sys, "frozen", False
@@ -502,6 +514,25 @@ def update_planning_card_state(card_name, var, value):
 
     with open(planning_state_file_location, "w") as planning_state_file:
         json.dump(state_data, planning_state_file, indent=4)
+    with _planning_cards_cache_lock:
+        _planning_cards_cache = None
+        _planning_cards_cache_mtime = None
+
+
+def get_csc_sites_data():
+    global _csc_sites_cache
+    with _csc_sites_cache_lock:
+        if _csc_sites_cache is not None:
+            return _csc_sites_cache
+        if getattr(
+            sys, "frozen", False
+        ):  # frozen means that we are running from a bundled app
+            csc_file = os.path.abspath(os.path.join(sys._MEIPASS, "csc_sites.json"))
+        else:
+            csc_file = os.path.join(os.path.dirname(__file__), "./csc_sites.json")
+        with open(csc_file, "r") as f:
+            _csc_sites_cache = json.load(f)
+        return _csc_sites_cache
 
 
 def _check_api_state_cached(telescope_id):
@@ -623,6 +654,17 @@ def method_sync(method, telescope_id=1, **kwargs):
     # print(f"method_sync {out=}")
 
     def err_extractor(obj):
+        # Some firmware/proxy combinations wrap the RPC payload under
+        # a device-number key, even for single-device requests.
+        if (
+            isinstance(obj, dict)
+            and "result" not in obj
+            and "error" not in obj
+            and len(obj) == 1
+        ):
+            inner = next(iter(obj.values()))
+            if isinstance(inner, dict):
+                obj = inner
         if obj and obj.get("error"):
             logger.warn(f"method_sync: {method} - {obj['error']}")
             result = {"command": method, "status": "error", "result": obj["error"]}
@@ -673,6 +715,20 @@ def get_client_master(telescope_id):
                 client_master = result["Client"].get("is_master", True)
 
     return client_master
+
+
+def get_firmware_ver_int(telescope_id):
+    if check_api_state(telescope_id):
+        state = method_sync("get_device_state", telescope_id)
+        return pydash.get(state, "device.firmware_ver_int", 0)
+    return 0
+
+
+def get_device_model(telescope_id):
+    if check_api_state(telescope_id):
+        state = method_sync("get_device_state", telescope_id)
+        return pydash.get(state, "device.product_model", 0)
+    return 0
 
 
 def get_guestmode_state(telescope_id):
@@ -855,8 +911,39 @@ def get_device_settings(telescope_id):
 
     settings = None
     if get_client_master(telescope_id):
-        settings_result = method_sync("get_setting", telescope_id)
-        stack_settings_result = method_sync("get_stack_setting", telescope_id)
+        fw = get_firmware_ver_int(telescope_id)
+        model = get_device_model(telescope_id)
+        settings_result = method_sync("get_setting", telescope_id) or {}
+        stack_settings_result = method_sync("get_stack_setting", telescope_id) or {}
+        stack_settings_error = (
+            not isinstance(stack_settings_result, dict)
+            or "error" in stack_settings_result
+        )
+
+        # Different firmware families expose stack settings in different places.
+        # Merge them and prefer get_stack_setting when it returns data.
+        merged_stack_settings = {}
+        stack_from_get_setting = pydash.get(settings_result, "stack", {})
+        if isinstance(stack_from_get_setting, dict):
+            merged_stack_settings.update(stack_from_get_setting)
+        if not stack_settings_error and isinstance(stack_settings_result, dict):
+            merged_stack_settings.update(stack_settings_result)
+
+        fallback_light_duration_min = pydash.get(
+            settings_result, "stack.light_duration_min"
+        )
+        fallback_save_discrete_ok_frame = pydash.get(
+            settings_result, "stack.save_discrete_ok_frame"
+        )
+        fallback_save_discrete_frame = pydash.get(
+            settings_result, "stack.save_discrete_frame"
+        )
+
+        stack_cont_capt = pydash.get(settings_result, "stack.cont_capt")
+        if stack_cont_capt is None:
+            stack_cont_capt = pydash.get(settings_result, "stack_cont_capt")
+        if stack_cont_capt is None:
+            stack_cont_capt = pydash.get(settings_result, "cont_capt")
 
         settings = {
             "stack_dither_pix": pydash.get(settings_result, "stack_dither.pix"),
@@ -866,26 +953,98 @@ def get_device_settings(telescope_id):
             "stack_dither_enable": pydash.get(settings_result, "stack_dither.enable"),
             "exp_ms_stack_l": pydash.get(settings_result, "exp_ms.stack_l"),
             "exp_ms_continuous": pydash.get(settings_result, "exp_ms.continuous"),
-            "save_discrete_ok_frame": pydash.get(
-                stack_settings_result, "save_discrete_ok_frame"
-            ),
-            "save_discrete_frame": pydash.get(
-                stack_settings_result, "save_discrete_frame"
-            ),
-            "light_duration_min": pydash.get(
-                stack_settings_result, "light_duration_min"
-            ),
             "auto_3ppa_calib": pydash.get(settings_result, "auto_3ppa_calib"),
             "frame_calib": pydash.get(settings_result, "frame_calib"),
-            "manual_exp": pydash.get(settings_result, "manual_exp"),
             "focal_pos": pydash.get(settings_result, "focal_pos"),
             "heater_enable": pydash.get(settings_result, "heater_enable"),
             "auto_power_off": pydash.get(settings_result, "auto_power_off"),
             "stack_lenhance": pydash.get(settings_result, "stack_lenhance"),
             "dark_mode": pydash.get(settings_result, "dark_mode"),
-            "stack_cont_capt": pydash.get(settings_result, "stack.cont_capt"),
+            "stack_cont_capt": stack_cont_capt,
             "stack_drizzle2x": pydash.get(settings_result, "stack.drizzle2x"),
         }
+
+        if fw > 2597:
+            plan_target_af = pydash.get(settings_result, "plan_target_af")
+            if plan_target_af is None:
+                plan_target_af = pydash.get(settings_result, "plan.target_af")
+
+            viewplan_gohome = pydash.get(settings_result, "viewplan_gohome")
+            if viewplan_gohome is None:
+                viewplan_gohome = pydash.get(settings_result, "viewplan_go_home")
+            if viewplan_gohome is None:
+                viewplan_gohome = pydash.get(settings_result, "viewplan.go_home")
+
+            settings |= {
+                "save_discrete_ok_frame": pydash.get(
+                    merged_stack_settings,
+                    "save_discrete_ok_frame",
+                    fallback_save_discrete_ok_frame,
+                ),
+                "save_discrete_frame": pydash.get(
+                    merged_stack_settings,
+                    "save_discrete_frame",
+                    fallback_save_discrete_frame,
+                ),
+                "light_duration_min": (
+                    fallback_light_duration_min
+                    if stack_settings_error
+                    else pydash.get(merged_stack_settings, "light_duration_min")
+                ),
+                "stack_capt_type": pydash.get(merged_stack_settings, "capt_type"),
+                "stack_capt_num": pydash.get(merged_stack_settings, "capt_num"),
+                "stack_brightness": pydash.get(
+                    merged_stack_settings, "brightness", 0.0
+                ),
+                "stack_contrast": pydash.get(merged_stack_settings, "contrast", 0.0),
+                "stack_saturation": pydash.get(
+                    merged_stack_settings, "saturation", 0.0
+                ),
+                "stack_dbe_enable": pydash.get(
+                    merged_stack_settings, "dbe_enable", False
+                ),
+                "plan_target_af": (
+                    plan_target_af if plan_target_af is not None else False
+                ),
+                "viewplan_gohome": (
+                    viewplan_gohome if viewplan_gohome is not None else False
+                ),
+                "expert_mode": pydash.get(settings_result, "expert_mode", False),
+            }
+        else:
+            settings |= {
+                "af_before_stack": pydash.get(
+                    settings_result, "af_before_stack", False
+                ),
+            }
+            if model == "Seestar S30 Pro":
+                settings |= {
+                    "stack_star_trails": pydash.get(
+                        settings_result, "stack.star_trails", False
+                    ),
+                }
+
+        # If either endpoint reports these stack-save fields, expose them.
+        for key, value in (
+            (
+                "save_discrete_ok_frame",
+                pydash.get(
+                    merged_stack_settings,
+                    "save_discrete_ok_frame",
+                    fallback_save_discrete_ok_frame,
+                ),
+            ),
+            (
+                "save_discrete_frame",
+                pydash.get(
+                    merged_stack_settings,
+                    "save_discrete_frame",
+                    fallback_save_discrete_frame,
+                ),
+            ),
+        ):
+            if value is not None:
+                settings[key] = value
     return settings
 
 
@@ -894,8 +1053,9 @@ def get_telescopes_state():
 
     return list(
         map(
-            lambda telescope: telescope
-            | {"stats": get_device_state(telescope["device_num"])},
+            lambda telescope: (
+                telescope | {"stats": get_device_state(telescope["device_num"])}
+            ),
             telescopes,
         )
     )
@@ -1021,66 +1181,69 @@ def get_nearest_csc():
     lat = Config.init_lat
     lng = Config.init_long
 
-    if getattr(
-        sys, "frozen", False
-    ):  # frozen means that we are running from a bundled app
-        csc_file = os.path.abspath(os.path.join(sys._MEIPASS, "csc_sites.json"))
-    else:
-        csc_file = os.path.join(os.path.dirname(__file__), "./csc_sites.json")
-
     closest_site = {}
+    cache_key = (round(float(lat), 3), round(float(lng), 3))
+    now_ts = time.time()
+    with _nearest_csc_cache_lock:
+        cached = _nearest_csc_cache.get(cache_key)
+        if cached and now_ts - cached["ts"] < _nearest_csc_cache_ttl_sec:
+            return dict(cached["value"])
 
     # Get list of all csc site locations
-    with open(csc_file, "r") as f:
-        data = json.load(f)
-        nearby_csc = []
+    data = get_csc_sites_data()
+    nearby_csc = []
 
-        # Get list of all sites within same or adjacent 1 degree lat/lng bin
-        try:
-            for x in range(-1, 2):
-                for y in range(-1, 2):
-                    lat_str = str(int(lat) + x)
-                    lng_str = str(int(lng) + y)
-                    if lat_str in data:
-                        if lng_str in data[lat_str]:
-                            sites_in_bin = data[lat_str][lng_str]
-                            for site in sites_in_bin:
-                                nearby_csc.append(site)
-        except:
-            # API returns error
-            closest_site = {
-                "status_msg": "ERROR parsing coordinates or reading from list of CSC sites"
-            }
-
-        curr_closest_km = 1000
-
-        # Find the closest site in Clear Dark Sky database within bins
-        for site in nearby_csc:
-            dist = lat_lng_distance_in_km(lat, lng, site["lat"], site["lng"])
-
-            if dist < curr_closest_km:
-                curr_closest_km = dist
-                closest_site = site
-
-        # Grab site url and return site data if within 100 km
-        if curr_closest_km < 1000:
-            closest_site["status_msg"] = "SUCCESS"
-            closest_site["dist_km"] = curr_closest_km
-            closest_site["full_img"] = (
-                "https://www.cleardarksky.com/c/" + closest_site["id"] + "csk.gif"
-            )
-            closest_site["mini_img"] = (
-                "https://www.cleardarksky.com/c/" + closest_site["id"] + "cs0.gif"
-            )
-            closest_site["href"] = (
-                "https://www.cleardarksky.com/c/" + closest_site["id"] + "key.html"
-            )
-        else:
-            closest_site = {
-                "status_msg": "No sites within 100 km. CSC sites are only available in the Continental US, Canada, and Northern Mexico"
-            }
-
+    # Get list of all sites within same or adjacent 1 degree lat/lng bin
+    try:
+        for x in range(-1, 2):
+            for y in range(-1, 2):
+                lat_str = str(int(lat) + x)
+                lng_str = str(int(lng) + y)
+                if lat_str in data:
+                    if lng_str in data[lat_str]:
+                        sites_in_bin = data[lat_str][lng_str]
+                        for site in sites_in_bin:
+                            nearby_csc.append(site)
+    except Exception:
+        # API returns error
+        closest_site = {
+            "status_msg": "ERROR parsing coordinates or reading from list of CSC sites"
+        }
+        with _nearest_csc_cache_lock:
+            _nearest_csc_cache[cache_key] = {"ts": now_ts, "value": closest_site}
         return closest_site
+
+    curr_closest_km = 1000
+
+    # Find the closest site in Clear Dark Sky database within bins
+    for site in nearby_csc:
+        dist = lat_lng_distance_in_km(lat, lng, site["lat"], site["lng"])
+
+        if dist < curr_closest_km:
+            curr_closest_km = dist
+            closest_site = site
+
+    # Grab site url and return site data if within 100 km
+    if curr_closest_km < 1000:
+        closest_site["status_msg"] = "SUCCESS"
+        closest_site["dist_km"] = curr_closest_km
+        closest_site["full_img"] = (
+            "https://www.cleardarksky.com/c/" + closest_site["id"] + "csk.gif"
+        )
+        closest_site["mini_img"] = (
+            "https://www.cleardarksky.com/c/" + closest_site["id"] + "cs0.gif"
+        )
+        closest_site["href"] = (
+            "https://www.cleardarksky.com/c/" + closest_site["id"] + "key.html"
+        )
+    else:
+        closest_site = {
+            "status_msg": "No sites within 100 km. CSC sites are only available in the Continental US, Canada, and Northern Mexico"
+        }
+
+    with _nearest_csc_cache_lock:
+        _nearest_csc_cache[cache_key] = {"ts": now_ts, "value": closest_site}
+    return dict(closest_site)
 
 
 def do_create_mosaic(req, resp, schedule, telescope_id):
@@ -1436,9 +1599,11 @@ def do_command(req, resp, telescope_id):
                 {"method": "scope_park", "params": {"equ_mode": False}},
             )
             return output
+        case "get_remote_state":
+            output = method_sync("get_device_state, telescope_id")
+            return output
         case _:
             logger.warn("No command found: %s", value)
-    # print ("Output: ", output)
 
 
 def do_support_bundle(req, telescope_id=1):
@@ -1562,6 +1727,44 @@ def render_template(req, resp, template_name, **context):
     )
 
 
+def render_fragment(req, resp, template_name, **context):
+    template = fetch_template(template_name)
+    resp.status = falcon.HTTP_200
+    resp.content_type = "text/html"
+    version = Version.app_version()
+    merged_context = dict(context)
+    merged_context.setdefault("webui_theme", Config.uitheme)
+    merged_context.setdefault("webui_text_color", Config.webui_text_color)
+    merged_context.setdefault("webui_font_family", Config.webui_font_family)
+    merged_context.setdefault("webui_font_url", Config.webui_font_url)
+    merged_context.setdefault("webui_link_color", Config.webui_link_color)
+    merged_context.setdefault("webui_accent_color", Config.webui_accent_color)
+    merged_context.setdefault("version", version)
+    resp.text = template.render(**merged_context)
+
+
+def respond_204_if_unchanged(resp, cache, lock, cache_key):
+    html = resp.text
+    with lock:
+        last_html = cache.get(cache_key)
+        if last_html == html:
+            resp.status = falcon.HTTP_204
+            resp.text = ""
+            return
+        cache[cache_key] = html
+
+
+def get_request_cache_identity(req):
+    remote_addr = getattr(req, "remote_addr", "") or ""
+    user_agent = req.get_header("User-Agent") or ""
+    current_url = (
+        req.get_header("HX-Current-URL")
+        or req.get_header("Referer")
+        or getattr(req, "relative_uri", "")
+    )
+    return (remote_addr, user_agent, current_url)
+
+
 def render_schedule_tab(req, resp, telescope_id, template_name, tab, values, errors):
     directory = os.path.join(os.getcwd(), "schedule")
     Path(directory).mkdir(parents=True, exist_ok=True)
@@ -1586,10 +1789,6 @@ def render_schedule_tab(req, resp, telescope_id, template_name, tab, values, err
         else:
             schedule = get_schedule["Value"]
             state = schedule.get("state", "stopped")
-    nearest_csc = get_nearest_csc()
-    if nearest_csc["status_msg"] != "SUCCESS":
-        nearest_csc["href"] = ""
-        nearest_csc["full_img"] = ""
     render_template(
         req,
         resp,
@@ -1791,6 +1990,15 @@ def get_live_status(telescope_id: int):
                 "elapsed": human_ts(stack["lapse_ms"]),
             }
 
+        snr_value = imager.snr
+        if (
+            snr_value is None
+            or not isinstance(snr_value, (int, float))
+            or not math.isfinite(snr_value)
+            or snr_value < 0
+        ):
+            snr_value = None
+
         response = {
             "target_name": pydash.get(dev.view_state, "target_name"),
             "state": state,
@@ -1802,10 +2010,11 @@ def get_live_status(telescope_id: int):
             "substage_percent": substage_percent,
             "stats": stats,
             "mode": mode,
-            "snr": imager.snr,
+            "snr": snr_value,
             "lapse_ms": human_ts(pydash.get(dev.view_state, "lapse_ms")),
             "ra": dev.ra,
             "dec": dev.dec,
+            "has_equ_coord": bool(getattr(dev, "has_equ_coord", False)),
         }
 
         status_update_frame = (
@@ -1921,6 +2130,26 @@ class HomeTelescopeResource:
             del context["telescopes"]
         render_template(
             req, resp, "index.html", now=now, telescopes=telescopes, **context
+        )
+
+
+class HomeContentResource:
+    @staticmethod
+    def on_get(req, resp, telescope_id=0):
+        telescopes = get_telescopes_state()
+        context_id = int(telescope_id)
+        if context_id == 0 and telescopes:
+            context_id = telescopes[0]["device_num"]
+        context = get_context(context_id, req)
+        # Avoid duplicate keyword when passing explicit telescopes=... below.
+        if "telescopes" in context:
+            del context["telescopes"]
+        render_fragment(
+            req,
+            resp,
+            "partials/home_content.html",
+            telescopes=telescopes,
+            **context,
         )
 
 
@@ -2786,6 +3015,9 @@ class ScheduleReStartResource(BaseResource):
 
 
 class ScheduleRefreshResource(BaseResource):
+    _last_render_by_key = {}
+    _lock = threading.Lock()
+
     def on_get(self, req, resp, telescope_id=0):
         context = get_context(telescope_id, req)
         current = do_action_device("get_schedule", telescope_id, {})
@@ -2796,8 +3028,20 @@ class ScheduleRefreshResource(BaseResource):
             schedule = {}
             state = "stopped"
 
+        open_accordion_id = req.get_param("open_accordion_id", default="")
         html = self.render_schedule_list_html(req, resp, schedule, context)
-        resp.media = {"state": state, "html": html}
+        cache_key = (int(telescope_id), open_accordion_id)
+        changed = True
+        with ScheduleRefreshResource._lock:
+            last_html = ScheduleRefreshResource._last_render_by_key.get(cache_key)
+            if last_html == html:
+                changed = False
+            else:
+                ScheduleRefreshResource._last_render_by_key[cache_key] = html
+
+        resp.media = {"state": state, "changed": changed}
+        if changed:
+            resp.media["html"] = html
         resp.content_type = "application/json"
         resp.status = falcon.HTTP_200
 
@@ -2821,6 +3065,9 @@ class ScheduleRefreshResource(BaseResource):
 
 
 class EventStatus:
+    _last_render_by_key = {}
+    _lock = threading.Lock()
+
     @staticmethod
     def on_get(req, resp, telescope_id=1):
         results = []
@@ -2887,10 +3134,26 @@ class EventStatus:
             **context,
         )
 
+        # HTMX polls this endpoint every second. Avoid repaint/reflow when output is unchanged.
+        cache_key = (
+            int(telescope_id),
+            action or "default",
+            get_request_cache_identity(req),
+        )
+        html = resp.text
+        with EventStatus._lock:
+            last_html = EventStatus._last_render_by_key.get(cache_key)
+            if last_html == html:
+                resp.status = falcon.HTTP_204
+                resp.text = ""
+                return
+            EventStatus._last_render_by_key[cache_key] = html
+
 
 class LivePage:
     @staticmethod
     def on_get(req, resp, telescope_id=1, mode=None):
+        LiveVideoResource.clear_cache_for_telescope(int(telescope_id))
         status = method_sync("get_view_state", telescope_id)
         context = get_context(telescope_id, req)
         now = datetime.now()
@@ -3040,11 +3303,6 @@ class LiveGainResource:
         # print("LiveFocusResource.post", increment)
 
         if 0 <= gain <= 300:
-            do_action_device(
-                "method_sync",
-                telescope_id,
-                {"method": "set_setting", "params": {"manual_exp": True}},
-            )
             output = do_action_device(
                 "method_sync",
                 telescope_id,
@@ -3072,11 +3330,6 @@ class LiveExposureResource:
         # print("LiveFocusResource.post", increment)
 
         if 1 <= exposure <= 200:
-            do_action_device(
-                "method_sync",
-                telescope_id,
-                {"method": "set_setting", "params": {"manual_exp": True}},
-            )
             output = do_action_device(
                 "method_sync",
                 telescope_id,
@@ -3105,6 +3358,19 @@ class LiveZoomResource(BaseResource):
 
 
 class LiveVideoResource(BaseResource):
+    _last_render_by_telescope = {}
+    _lock = threading.Lock()
+
+    @staticmethod
+    def clear_cache_for_telescope(telescope_id: int):
+        with LiveVideoResource._lock:
+            to_remove = []
+            for key in LiveVideoResource._last_render_by_telescope:
+                if key[0] == int(telescope_id):
+                    to_remove.append(key)
+            for key in to_remove:
+                del LiveVideoResource._last_render_by_telescope[key]
+
     def on_get(self, req, resp, telescope_id: int = 1):
         # print("LiveViewResource.on_get telescope_id:", telescope_id)
         dev = telescope.get_seestar_device(telescope_id)
@@ -3125,6 +3391,16 @@ class LiveVideoResource(BaseResource):
             render_template(
                 req, resp, "partials/live_video_record.html", state=state, **context
             )
+
+        html = resp.text
+        key = (int(telescope_id), get_request_cache_identity(req))
+        with LiveVideoResource._lock:
+            last_html = LiveVideoResource._last_render_by_telescope.get(key)
+            if last_html == html:
+                resp.status = falcon.HTTP_204
+                resp.text = ""
+                return
+            LiveVideoResource._last_render_by_telescope[key] = html
 
     def on_post(self, req, resp, telescope_id: int = 1):
         # If status is stopped, start recording, otherwise stop
@@ -3304,33 +3580,134 @@ class SettingsResource(BaseResource):
 
     def on_post(self, req, resp, telescope_id=0):
         PostedSettings = req.media
+        fw = get_firmware_ver_int(telescope_id)
+        model = get_device_model(telescope_id)
+
+        def _safe_int(value, default):
+            try:
+                if value in (None, "", "None"):
+                    return default
+                return int(value)
+            except (TypeError, ValueError):
+                return default
+
+        def _safe_float(value, default):
+            try:
+                if value in (None, "", "None"):
+                    return default
+                return float(value)
+            except (TypeError, ValueError):
+                return default
+
+        def _did_set_setting_succeed(action_output):
+            if not action_output:
+                return False
+            if action_output.get("ErrorNumber", -1) != 0:
+                return False
+            value = action_output.get("Value")
+            if isinstance(value, dict) and "code" not in value and len(value) == 1:
+                inner = next(iter(value.values()))
+                if isinstance(inner, dict):
+                    value = inner
+            if isinstance(value, dict):
+                if value.get("error"):
+                    return False
+                code = value.get("code")
+                if code is not None and code != 0:
+                    return False
+            return True
+
+        def _try_set_setting_variants(setting_variants):
+            last_output = {"ErrorNumber": 1, "ErrorMessage": "No variants attempted"}
+            for params in setting_variants:
+                out = do_action_device(
+                    "method_sync",
+                    telescope_id,
+                    {"method": "set_setting", "params": params},
+                )
+                last_output = out or last_output
+                if _did_set_setting_succeed(out):
+                    return out, True
+            return last_output, False
+
+        def _try_method_sync_variants(method_variants):
+            last_output = {"ErrorNumber": 1, "ErrorMessage": "No variants attempted"}
+            for method_name, params in method_variants:
+                out = do_action_device(
+                    "method_sync",
+                    telescope_id,
+                    {"method": method_name, "params": params},
+                )
+                last_output = out or last_output
+                if _did_set_setting_succeed(out):
+                    return out, True
+            return last_output, False
 
         # Convert the form names back into the required format
         FormattedNewSettings = {
             "stack_lenhance": str2bool(PostedSettings["stack_lenhance"]),
             "stack_dither": {
-                "pix": int(PostedSettings["stack_dither_pix"]),
-                "interval": int(PostedSettings["stack_dither_interval"]),
+                "pix": _safe_int(PostedSettings["stack_dither_pix"], 0),
+                "interval": _safe_int(PostedSettings["stack_dither_interval"], 0),
                 "enable": str2bool(PostedSettings["stack_dither_enable"]),
             },
             "exp_ms": {
-                "stack_l": int(PostedSettings["exp_ms_stack_l"]),
-                "continuous": int(PostedSettings["exp_ms_continuous"]),
+                "stack_l": _safe_int(PostedSettings["exp_ms_stack_l"], 0),
+                "continuous": _safe_int(PostedSettings["exp_ms_continuous"], 0),
             },
-            "focal_pos": int(PostedSettings["focal_pos"]),
+            "focal_pos": _safe_int(PostedSettings["focal_pos"], 0),
             "auto_power_off": str2bool(PostedSettings["auto_power_off"]),
             "auto_3ppa_calib": str2bool(PostedSettings["auto_3ppa_calib"]),
             "frame_calib": str2bool(PostedSettings["frame_calib"]),
-            "manual_exp": str2bool(PostedSettings["manual_exp"]),
         }
 
-        FormattedNewStackSettings = {
-            "save_discrete_frame": str2bool(PostedSettings["save_discrete_frame"]),
-            "save_discrete_ok_frame": str2bool(
-                PostedSettings["save_discrete_ok_frame"]
-            ),
-            "light_duration_min": int(PostedSettings["light_duration_min"]),
-        }
+        if fw >= 2670:
+            FormattedNewSettings |= {
+                "expert_mode": str2bool(PostedSettings["expert_mode"]),
+            }
+        else:
+            if "af_before_stack" in PostedSettings:
+                FormattedNewSettings |= {
+                    "af_before_stack": str2bool(PostedSettings["af_before_stack"])
+                }
+
+        FormattedNewStackSettings = {}
+        has_stack_settings_input = any(
+            key in PostedSettings
+            for key in (
+                "save_discrete_frame",
+                "save_discrete_ok_frame",
+                "light_duration_min",
+                "stack_capt_type",
+                "stack_capt_num",
+                "stack_brightness",
+                "stack_contrast",
+                "stack_saturation",
+                "stack_dbe_enable",
+            )
+        )
+        if has_stack_settings_input:
+            FormattedNewStackSettings = {
+                "save_discrete_frame": str2bool(
+                    PostedSettings.get("save_discrete_frame", False)
+                ),
+                "save_discrete_ok_frame": str2bool(
+                    PostedSettings.get("save_discrete_ok_frame", False)
+                ),
+                "light_duration_min": _safe_int(
+                    PostedSettings.get("light_duration_min"), -1
+                ),
+                "capt_type": PostedSettings.get("stack_capt_type", "stack"),
+                "capt_num": _safe_int(PostedSettings.get("stack_capt_num"), 0),
+                "brightness": _safe_float(
+                    PostedSettings.get("stack_brightness", 0.0), 0.0
+                ),
+                "contrast": _safe_float(PostedSettings.get("stack_contrast", 0.0), 0.0),
+                "saturation": _safe_float(
+                    PostedSettings.get("stack_saturation", 0.0), 0.0
+                ),
+                "dbe_enable": str2bool(PostedSettings.get("stack_dbe_enable", False)),
+            }
 
         # Dew Heater is wierd
         if str2bool(PostedSettings["heater_enable"]):
@@ -3370,11 +3747,12 @@ class SettingsResource(BaseResource):
         )
         # Live Stack Mode is another one like dark_mode.
         cont_capt = str2bool(PostedSettings["stack_cont_capt"])
-        LiveModeSettings = {"stack": {"cont_capt": cont_capt}}
-        live_mode_output = do_action_device(
-            "method_sync",
-            telescope_id,
-            {"method": "set_setting", "params": LiveModeSettings},
+        live_mode_output, live_mode_success = _try_set_setting_variants(
+            [
+                {"stack": {"cont_capt": cont_capt}},
+                {"stack_cont_capt": cont_capt},
+                {"cont_capt": cont_capt},
+            ]
         )
         # 4k Mode is another one like cont_capt
         drizzle2x = str2bool(PostedSettings["stack_drizzle2x"])
@@ -3384,18 +3762,86 @@ class SettingsResource(BaseResource):
             telescope_id,
             {"method": "set_setting", "params": DrizzleModeSettings},
         )
-        stack_settings_output = do_action_device(
-            "method_sync",
-            telescope_id,
-            {"method": "set_stack_setting", "params": FormattedNewStackSettings},
-        )
+        plan_target_af_output = {"ErrorNumber": 0}
+        plan_target_af_success = True
+        viewplan_gohome_output = {"ErrorNumber": 0}
+        viewplan_gohome_success = True
+        if fw >= 2670:
+            plan_target_af = str2bool(PostedSettings["plan_target_af"])
+            plan_target_af_output, plan_target_af_success = _try_set_setting_variants(
+                [
+                    {"plan_target_af": plan_target_af},
+                    {"plan": {"target_af": plan_target_af}},
+                ]
+            )
+            viewplan_gohome = str2bool(PostedSettings["viewplan_gohome"])
+            viewplan_gohome_output, viewplan_gohome_success = _try_set_setting_variants(
+                [
+                    {"viewplan_gohome": viewplan_gohome},
+                    {"viewplan_go_home": viewplan_gohome},
+                    {"viewplan": {"go_home": viewplan_gohome}},
+                ]
+            )
+        star_trails_output = {"ErrorNumber": 0}
+        if (
+            fw <= 2597
+            and model == "Seestar S30 Pro"
+            and "stack_star_trails" in PostedSettings
+        ):
+            StarTrailsSettings = {
+                "stack": {"star_trails": str2bool(PostedSettings["stack_star_trails"])}
+            }
+            star_trails_output = do_action_device(
+                "method_sync",
+                telescope_id,
+                {"method": "set_setting", "params": StarTrailsSettings},
+            )
+        stack_settings_output = {"ErrorNumber": 0}
+        stack_settings_success = True
+        if FormattedNewStackSettings:
+            # Some firmware accepts stack fields via set_setting(stack=...),
+            # while others still require set_stack_setting.
+            stack_save_compat_settings = {
+                k: FormattedNewStackSettings[k]
+                for k in (
+                    "save_discrete_frame",
+                    "save_discrete_ok_frame",
+                    "light_duration_min",
+                )
+                if k in FormattedNewStackSettings
+            }
+            if fw > 2597:
+                method_variants = [
+                    ("set_setting", {"stack": FormattedNewStackSettings})
+                ]
+                if stack_save_compat_settings:
+                    method_variants.append(
+                        ("set_stack_setting", stack_save_compat_settings)
+                    )
+                    method_variants.append(
+                        ("set_stack_settings", stack_save_compat_settings)
+                    )
+            else:
+                method_variants = [
+                    ("set_stack_setting", FormattedNewStackSettings),
+                    ("set_stack_settings", FormattedNewStackSettings),
+                    ("set_setting", {"stack": FormattedNewStackSettings}),
+                ]
+            stack_settings_output, stack_settings_success = _try_method_sync_variants(
+                method_variants
+            )
 
         if (
             settings_output["ErrorNumber"]
             or stack_settings_output["ErrorNumber"]
+            or not stack_settings_success
             or live_mode_output["ErrorNumber"]
             or dark_mode_output["ErrorNumber"]
             or drizzle_mode_output["ErrorNumber"]
+            or star_trails_output["ErrorNumber"]
+            or not live_mode_success
+            or not plan_target_af_success
+            or not viewplan_gohome_success
         ):
             output = "Error Updating Settings."
         else:
@@ -3415,16 +3861,55 @@ class SettingsResource(BaseResource):
     def render_settings(req, resp, telescope_id, output):
         settings = {}
         context = get_context(telescope_id, req)
+        firmware_ver_int = 0
         if telescope_id == 0:
             telescopes = get_telescopes()
             for tel in telescopes:
                 tel_id = tel["device_num"]
                 if check_api_state(tel_id):
+                    firmware_ver_int = get_firmware_ver_int(tel_id)
                     settings = get_device_settings(tel_id)
                     break
         else:
             if context["online"]:
+                firmware_ver_int = get_firmware_ver_int(telescope_id)
                 settings = get_device_settings(telescope_id)
+
+        min_fw_by_key = {
+            "stack_dither_pix": 0,
+            "stack_dither_interval": 0,
+            "stack_dither_enable": 0,
+            "exp_ms_stack_l": 0,
+            "exp_ms_continuous": 0,
+            "auto_3ppa_calib": 0,
+            "frame_calib": 0,
+            "focal_pos": 0,
+            "heater_enable": 0,
+            "auto_power_off": 0,
+            "stack_lenhance": 0,
+            "dark_mode": 0,
+            "stack_cont_capt": 0,
+            "stack_drizzle2x": 0,
+            "save_discrete_ok_frame": 0,
+            "save_discrete_frame": 0,
+            "light_duration_min": 2598,
+            "stack_capt_type": 2598,
+            "stack_capt_num": 2598,
+            "stack_brightness": 2598,
+            "stack_contrast": 2598,
+            "stack_saturation": 2598,
+            "stack_dbe_enable": 2598,
+            "plan_target_af": 2670,
+            "viewplan_gohome": 2670,
+            "expert_mode": 2670,
+            "af_before_stack": 0,
+            "stack_star_trails": 0,
+        }
+        settings = {
+            key: value
+            for key, value in settings.items()
+            if firmware_ver_int >= min_fw_by_key.get(key, 0)
+        }
         # Maybe we can store this better?
         settings_friendly_names = {
             "stack_dither_pix": "Stack Dither Pixels",
@@ -3435,11 +3920,21 @@ class SettingsResource(BaseResource):
             "save_discrete_ok_frame": "Save Sub Frames",
             "save_discrete_frame": "Save Failed Sub Frames",
             "light_duration_min": "Light Duration Min",
+            "stack_capt_type": "Stack Capture Type",
+            "stack_capt_num": "Stack Capture Count",
+            "stack_brightness": "Stack Brightness",
+            "stack_contrast": "Stack Contrast",
+            "stack_saturation": "Stack Saturation",
+            "stack_dbe_enable": "Stack DBE",
+            "plan_target_af": "Plan Target AF",
+            "viewplan_gohome": "Viewplan Go Home",
+            "expert_mode": "Expert Mode",
+            "af_before_stack": "AF Before Stack",
+            "stack_star_trails": "Stack Star Trails",
             "auto_3ppa_calib": "Horizontal Calibration",
             "frame_calib": "Frame Calibration",
             "stack_masic": "Stack Mosaic",
             "rec_stablzn": "Record Stabilization",
-            "manual_exp": "Manual Exposure",
             "isp_exp_ms": "isp_exp_ms",
             "calib_location": "calib_location",
             "wide_cam": "Wide Cam",
@@ -3463,11 +3958,21 @@ class SettingsResource(BaseResource):
             "save_discrete_ok_frame": "Save sub frames. (Doesn't include failed.)",
             "save_discrete_frame": 'Save failed sub frames. (Failed sub frames will have "_failed" added to their filename.)',
             "light_duration_min": "Light Duration Min.",
+            "stack_capt_type": "Stack capture mode/type.",
+            "stack_capt_num": "Number of frames to capture.",
+            "stack_brightness": "Adjust live stack brightness.",
+            "stack_contrast": "Adjust live stack contrast.",
+            "stack_saturation": "Adjust live stack saturation.",
+            "stack_dbe_enable": "Enable Dynamic Background Extraction.",
+            "plan_target_af": "Auto-focus before planned targets.",
+            "viewplan_gohome": "Return home after plan view.",
+            "expert_mode": "Enable expert mode features.",
+            "af_before_stack": "Auto-focus before stacking.",
+            "stack_star_trails": "Enable star trails stacking.",
             "auto_3ppa_calib": "In AltAz mode, enable/disable automatic horizontal calibration at the start of an imaging session",
             "frame_calib": "Frame Calibration",
             "stack_masic": "Stack Mosaic",
             "rec_stablzn": "Record Stabilization",
-            "manual_exp": "Manual Exposure",
             "isp_exp_ms": "isp_exp_ms",
             "calib_location": "calib_location",
             "wide_cam": "Wide Cam",
@@ -3489,6 +3994,7 @@ class SettingsResource(BaseResource):
             settings_friendly_names=settings_friendly_names,
             settings_helper_text=settings_helper_text,
             output=output,
+            firmware_ver_int=firmware_ver_int,
             **context,
         )
 
@@ -3543,6 +4049,28 @@ class StatsResource:
         context = get_context(telescope_id, req)
 
         render_template(req, resp, "stats.html", stats=stats, now=now, **context)
+
+
+class StatsContentResource:
+    _last_render_by_key = {}
+    _lock = threading.Lock()
+
+    @staticmethod
+    def on_get(req, resp, telescope_id=1):
+        if telescope_id == 0:
+            stats = {}
+        else:
+            stats = get_device_state(telescope_id)
+        context = get_context(telescope_id, req)
+        render_fragment(
+            req, resp, "partials/stats_content.html", stats=stats, **context
+        )
+        respond_204_if_unchanged(
+            resp,
+            StatsContentResource._last_render_by_key,
+            StatsContentResource._lock,
+            ("stats-content", int(telescope_id)),
+        )
 
 
 class StartupResource(BaseResource):
@@ -3627,6 +4155,33 @@ class GuestModeResource:
     def on_post(self, req, resp, telescope_id=0):
         do_command(req, resp, telescope_id)
         self.on_get(req, resp, telescope_id)
+
+
+class GuestModeContentResource:
+    _last_render_by_key = {}
+    _lock = threading.Lock()
+
+    @staticmethod
+    def on_get(req, resp, telescope_id=1):
+        context = get_context(telescope_id, req)
+        if telescope_id == 0 or not context["online"]:
+            state = {}
+        else:
+            state = get_guestmode_state(telescope_id)
+        render_fragment(
+            req,
+            resp,
+            "partials/guestmode_content.html",
+            state=state,
+            action=f"/{telescope_id}/guestmode",
+            **context,
+        )
+        respond_204_if_unchanged(
+            resp,
+            GuestModeContentResource._last_render_by_key,
+            GuestModeContentResource._lock,
+            ("guestmode-content", int(telescope_id)),
+        )
 
 
 class SupportResource:
@@ -4092,9 +4647,10 @@ class ConfigResource:
         now = datetime.now()
         context = get_context(telescope_id, req)
 
-        logger.info(f"GOT POST config: {req.media}")
         Config.load_from_form(req)
         Config.save_toml()
+
+        logger.info(f"GOT POST config: {req.media}")
 
         render_template(req, resp, "config.html", now=now, config=Config, **context)
 
@@ -4550,6 +5106,9 @@ class FrontMain:
         app.add_route("/schedule/upload", ScheduleUploadResource())
         app.add_route("/startup", StartupResource())
         app.add_route("/stats", StatsResource())
+        app.add_route("/home-content", HomeContentResource())
+        app.add_route("/stats-content", StatsContentResource())
+        app.add_route("/guestmode-content", GuestModeContentResource())
         app.add_route("/guestmode", GuestModeResource())
         app.add_route("/support", SupportResource())
         app.add_route("/eventstatus", EventStatus())
@@ -4618,6 +5177,11 @@ class FrontMain:
         app.add_route("/{telescope_id:int}/schedule/upload", ScheduleUploadResource())
         app.add_route("/{telescope_id:int}/startup", StartupResource())
         app.add_route("/{telescope_id:int}/stats", StatsResource())
+        app.add_route("/{telescope_id:int}/home-content", HomeContentResource())
+        app.add_route("/{telescope_id:int}/stats-content", StatsContentResource())
+        app.add_route(
+            "/{telescope_id:int}/guestmode-content", GuestModeContentResource()
+        )
         app.add_route("/{telescope_id:int}/guestmode", GuestModeResource())
         app.add_route("/{telescope_id:int}/support", SupportResource())
         app.add_route("/{telescope_id:int}/system", SystemResource())
